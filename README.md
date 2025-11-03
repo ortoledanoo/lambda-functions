@@ -53,6 +53,76 @@ Account B (Authorization & Upload):
 - **Multipart Upload Support**: Handles large files efficiently
 - **Daily Counter**: Prevents code reuse with daily counter
 - **TTL Validation**: Configurable expiration (hours-based)
+- **Secure API Gateway Integration**: Presigned URL requires authorizer context (no bypass)
+
+## How the Cryptographic System Works
+
+### Understanding HMAC and Code Generation
+
+Think of HMAC (Hash-based Message Authentication Code) like a special signature that only the correct key can create. Here's how it works in simple terms:
+
+#### 1. Code Generation (Account A)
+
+When a user requests a code, the system:
+
+1. **Gets a daily counter**: Increments a number in DynamoDB (one per day). This ensures each code is unique.
+2. **Builds a message**: Combines three parts:
+   - Counter (10 bits): The daily counter number (0-1023)
+   - Date (YYYY-MM-DD): Today's date
+   - Hours (number): Current hours since epoch (for TTL validation)
+   
+   Example: `0000001010|2024-01-15|1234567`
+
+3. **Creates a MAC signature**: Uses AWS KMS to generate an HMAC signature of this message. KMS takes the message and a secret key, and produces a unique "signature" that can't be forged.
+   
+   - The MAC is like a fingerprint: same message + same key = same MAC
+   - Different message or different key = different MAC
+   - You can't create a valid MAC without the secret key
+
+4. **Encodes as words**: Takes the first 100 bits (10-bit counter + 90-bit MAC) and converts them into 10 human-readable words.
+   
+   - Each word represents 10 bits (0-1023)
+   - Dictionary: `word0000`, `word0001`, ... `word1023`
+   - Example output: `word0001 word0023 word0456 word0789 word0123 word0456 word0789 word0123 word0456 word0789`
+
+#### 2. Code Validation (Account B)
+
+When a user provides a code, the system:
+
+1. **Decodes the words**: Converts the 10 words back into 100 bits
+   - Extracts counter (first 10 bits)
+   - Extracts MAC signature (last 90 bits)
+
+2. **Tries to recreate the signature**: 
+   - Builds the same message format: `counter|date|hours`
+   - Tries different hours within the TTL window (to handle clock differences)
+   - Uses KMS to generate a MAC for each attempt
+
+3. **Compares signatures**: 
+   - If the generated MAC matches the MAC from the code → **valid**
+   - If they don't match → **invalid** (code is fake or expired)
+
+4. **Checks expiration**: 
+   - If a valid MAC is found, checks if the hours are within the allowed TTL window
+   - If code is older than TTL → **expired**
+
+#### Why This Is Secure
+
+- **Cryptographic proof**: You can't fake a valid MAC without the KMS key. Even if someone sees a valid code, they can't create a new one.
+- **Time-bound**: Codes expire after X hours, preventing long-term abuse.
+- **Stateless**: No database lookup needed. The code itself proves its validity.
+- **Unique**: Daily counter ensures no code is reused on the same day.
+
+#### Simple Analogy
+
+Think of it like a concert ticket:
+- **Counter**: Ticket number (unique per day)
+- **Date**: Show date
+- **Hours**: Time of purchase (for expiration)
+- **MAC**: A holographic sticker that can only be created by the ticket printer (KMS key)
+- **Validation**: The bouncer (authorizer) checks if the hologram matches what the printer would create for that ticket number, date, and time
+
+Without the real printer (KMS key), you can't create a valid ticket (code).
 
 ## Components
 
@@ -148,6 +218,9 @@ X-Authorization-Words: word0001 word0023 ... word0999
 - **Single-part upload**: For smaller files
 - Content type validation
 - File size limits
+- **Requires Authorizer Context**: Can only be called through API Gateway with valid authorizer (no bypass)
+
+**Security**: This function **requires** `principalId` from API Gateway authorizer context. It cannot be called directly without going through the authorizer validation first.
 
 **Input**:
 ```json
@@ -310,7 +383,23 @@ aws lambda create-function \
   --profile account-a
 ```
 
-### Step 4: Deploy Authorizer Lambda (Account B)
+### Step 4: Configure API Gateway Authorizer (Account B)
+
+Before deploying presign URL, set up API Gateway with Lambda Authorizer:
+
+1. Create API Gateway REST API or HTTP API
+2. Configure Lambda Authorizer:
+   - Type: Token
+   - Authorizer Lambda: `file-whitelist-authorizer`
+   - Token Source: `Authorization` header
+   - Identity Source: Leave default
+
+3. Configure `/presign-url` endpoint:
+   - Method: POST
+   - Authorization: Use the Lambda Authorizer
+   - Integration: Lambda function `file-whitelist-presign-url`
+
+### Step 5: Deploy Authorizer Lambda (Account B)
 
 ```bash
 cd authorizer
@@ -523,7 +612,20 @@ cat response.json
 
 ### Test Presign URL (Account B)
 
-**Single-part upload:**
+**Note**: This function requires API Gateway authorizer context. Direct Lambda invocation will return 401.
+
+**Via API Gateway (recommended):**
+```bash
+# First, validate code to get authorization
+# Then call presign URL endpoint with Authorization header
+
+curl -X POST https://api-account-b.execute-api.region.amazonaws.com/presign-url \
+  -H "Authorization: word0001 word0023 word0456 word0789 word0123 word0456 word0789 word0123 word0456 word0789" \
+  -H "Content-Type: application/json" \
+  -d '{"action": "getPresignedUrl", "contentType": "application/pdf", "filename": "test.pdf"}'
+```
+
+**Direct Lambda (for testing only - requires simulating authorizer context):**
 ```bash
 aws lambda invoke \
   --function-name file-whitelist-presign-url \
@@ -618,10 +720,12 @@ lambda-functions/
 - Check code hasn't expired (within TTL window)
 
 ### Presigned URL Fails
+- **401 Unauthorized**: Missing authorizer context - ensure API Gateway is configured with Lambda Authorizer
 - Check S3 bucket exists in Account B
 - Verify MINIMAL_S3_ROLE_ARN is correct
 - Ensure Lambda role can AssumeRole
 - Check bucket name is correct
+- **Direct invocation**: This function cannot be called directly - must go through API Gateway
 
 ## License
 

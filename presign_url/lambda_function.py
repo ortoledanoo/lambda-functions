@@ -24,15 +24,15 @@ if not logger.handlers:
     logger.addHandler(handler)
 
 # Configuration
-BUCKET_NAME = os.environ.get('UPLOAD_BUCKET_NAME')
+BUCKET_NAME = os.environ.get('UPLOAD_BUCKET_NAME', '').strip()
 if not BUCKET_NAME:
     raise ValueError("UPLOAD_BUCKET_NAME environment variable is required")
 
-MINIMAL_S3_ROLE_ARN = os.environ.get('MINIMAL_S3_ROLE_ARN')
+MINIMAL_S3_ROLE_ARN = os.environ.get('MINIMAL_S3_ROLE_ARN', '').strip()
 if not MINIMAL_S3_ROLE_ARN:
     raise ValueError("MINIMAL_S3_ROLE_ARN environment variable is required")
 
-ALLOWED_CONTENT_TYPES = os.environ.get('ALLOWED_CONTENT_TYPES', '*/*').split(',')
+ALLOWED_CONTENT_TYPES = [t.strip() for t in os.environ.get('ALLOWED_CONTENT_TYPES', '*/*').split(',')]
 MAX_FILE_SIZE_MB = int(os.environ.get('MAX_FILE_SIZE_MB', '5000'))  # Default: 5GB for multipart
 
 # Initialize STS client
@@ -60,9 +60,21 @@ def get_s3_client_with_assumed_role():
         credentials = response['Credentials']
         logger.info('Successfully assumed role')
         
-        # Create S3 client with assumed role credentials
+        # Get AWS region from environment or use default
+        region = os.environ.get('AWS_REGION') or os.environ.get('AWS_DEFAULT_REGION') or 'il-central-1'
+        
+        # Configure S3 client to use regional endpoint
+        from botocore.config import Config
+        config = Config(
+            region_name=region,
+            s3={'addressing_style': 'virtual'}
+        )
+        
+        # Create S3 client with assumed role credentials and regional config
         s3_client = boto3.client(
             's3',
+            region_name=region,
+            config=config,
             aws_access_key_id=credentials['AccessKeyId'],
             aws_secret_access_key=credentials['SecretAccessKey'],
             aws_session_token=credentials['SessionToken']
@@ -107,6 +119,7 @@ def get_presigned_url(key: str, content_type: str) -> Dict[str, Any]:
         from botocore.awsrequest import AWSRequest
         
         # Generate presigned URL
+        # Note: ServerSideEncryption not needed - bucket has default encryption
         url = s3_client.generate_presigned_url(
             'put_object',
             Params={
@@ -142,6 +155,7 @@ def create_multipart_upload(key: str, content_type: str) -> Dict[str, Any]:
             Bucket=BUCKET_NAME,
             Key=key,
             ContentType=content_type
+            # Note: ServerSideEncryption not needed - bucket has default encryption
         )
         
         return {
@@ -291,13 +305,17 @@ def abort_multipart_upload(key: str, upload_id: str) -> Dict[str, Any]:
 
 def validate_content_type(content_type: Optional[str]) -> bool:
     """Validate that content type is allowed."""
-    if '*' in ALLOWED_CONTENT_TYPES:
+    # Check for wildcard (allow all)
+    if any('*' in allowed or allowed == '*/*' for allowed in ALLOWED_CONTENT_TYPES):
         return True
+    
     if not content_type:
         return False
     
     for allowed in ALLOWED_CONTENT_TYPES:
         allowed = allowed.strip()
+        if allowed == '*/*' or allowed == '*':
+            return True
         if allowed.endswith('/*'):
             base_type = allowed.split('/')[0]
             if content_type.startswith(f"{base_type}/"):
@@ -313,17 +331,12 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     try:
         logger.info("Presign URL Lambda invoked")
         
-        # Extract code/keyId from authorizer context
+        # Extract keyId from authorizer context (required - no fallback)
         authorizer_context = event.get('requestContext', {}).get('authorizer', {})
         key_id = authorizer_context.get('principalId')
         
-        # If not in authorizer context, code should be validated separately
         if not key_id:
-            # Try to get from body (if called standalone after validation)
-            body = {}
-            if 'body' in event:
-                body = json.loads(event['body']) if isinstance(event['body'], str) else event['body']
-            key_id = body.get('key_id') or body.get('code')
+            return create_response(401, {'error': 'Unauthorized: missing authorizer context'})
         
         # Parse request body
         body = {}
