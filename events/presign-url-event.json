@@ -1,0 +1,9 @@
+{
+  "requestContext": {
+    "authorizer": {
+      "principalId": "your_code_here"
+    }
+  },
+  "body": "{\"filename\": \"test.pdf\", \"content_type\": \"application/pdf\"}"
+}
+
