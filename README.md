@@ -383,23 +383,9 @@ aws lambda create-function \
   --profile account-a
 ```
 
-### Step 4: Configure API Gateway Authorizer (Account B)
+### Step 4: Deploy Authorizer Lambda (Account B)
 
-Before deploying presign URL, set up API Gateway with Lambda Authorizer:
-
-1. Create API Gateway REST API or HTTP API
-2. Configure Lambda Authorizer:
-   - Type: Token
-   - Authorizer Lambda: `file-whitelist-authorizer`
-   - Token Source: `Authorization` header
-   - Identity Source: Leave default
-
-3. Configure `/presign-url` endpoint:
-   - Method: POST
-   - Authorization: Use the Lambda Authorizer
-   - Integration: Lambda function `file-whitelist-presign-url`
-
-### Step 5: Deploy Authorizer Lambda (Account B)
+**Important**: Deploy the Authorizer Lambda **before** configuring API Gateway, as API Gateway needs the Lambda ARN.
 
 ```bash
 cd authorizer
@@ -423,9 +409,337 @@ aws lambda create-function \
     API_GW_ARN=arn:aws:execute-api:region:ACCOUNT_B_ID:api-id/*/*
   }" \
   --profile account-b
+
+# Grant API Gateway permission to invoke the authorizer
+aws lambda add-permission \
+  --function-name file-whitelist-authorizer \
+  --statement-id api-gateway-invoke \
+  --action lambda:InvokeFunction \
+  --principal apigateway.amazonaws.com \
+  --profile account-b
 ```
 
-### Step 5: Create IAM Role for STS AssumeRole (Account B)
+**Note**: Get the Lambda ARN for the next step:
+```bash
+AUTHORIZER_ARN=$(aws lambda get-function \
+  --function-name file-whitelist-authorizer \
+  --query 'Configuration.FunctionArn' \
+  --output text \
+  --profile account-b)
+```
+
+### Step 5: Deploy API Gateway with Lambda Authorizer (Account B)
+
+You can use either **REST API** or **HTTP API**. HTTP API is simpler and cheaper, but REST API offers more control.
+
+#### Option A: REST API (More Control)
+
+**1. Create REST API:**
+
+```bash
+# Create REST API
+API_ID=$(aws apigateway create-rest-api \
+  --name file-whitelist-api \
+  --description "File whitelist API with Lambda authorizer" \
+  --endpoint-configuration types=REGIONAL \
+  --profile account-b \
+  --query 'id' \
+  --output text)
+
+echo "API ID: $API_ID"
+```
+
+**2. Get Root Resource ID:**
+
+```bash
+ROOT_RESOURCE_ID=$(aws apigateway get-resources \
+  --rest-api-id $API_ID \
+  --profile account-b \
+  --query 'items[?path==`/`].id' \
+  --output text)
+
+echo "Root Resource ID: $ROOT_RESOURCE_ID"
+```
+
+**3. Create `/presign-url` Resource:**
+
+```bash
+RESOURCE_ID=$(aws apigateway create-resource \
+  --rest-api-id $API_ID \
+  --parent-id $ROOT_RESOURCE_ID \
+  --path-part presign-url \
+  --profile account-b \
+  --query 'id' \
+  --output text)
+
+echo "Resource ID: $RESOURCE_ID"
+```
+
+**4. Create Lambda Authorizer:**
+
+```bash
+# Get authorizer Lambda ARN
+AUTHORIZER_ARN=$(aws lambda get-function \
+  --function-name file-whitelist-authorizer \
+  --query 'Configuration.FunctionArn' \
+  --output text \
+  --profile account-b)
+
+# Create authorizer
+AUTHORIZER_ID=$(aws apigateway create-authorizer \
+  --rest-api-id $API_ID \
+  --name file-whitelist-authorizer \
+  --type TOKEN \
+  --authorizer-uri "arn:aws:apigateway:REGION:lambda:path/2015-03-31/functions/$AUTHORIZER_ARN/invocations" \
+  --identity-source method.request.header.Authorization \
+  --authorizer-credentials $(aws iam get-role --role-name api-gateway-invoke-role --query 'Role.Arn' --output text --profile account-b) \
+  --profile account-b \
+  --query 'id' \
+  --output text)
+
+echo "Authorizer ID: $AUTHORIZER_ID"
+```
+
+**5. Create POST Method with Authorizer:**
+
+```bash
+# Create POST method
+aws apigateway put-method \
+  --rest-api-id $API_ID \
+  --resource-id $RESOURCE_ID \
+  --http-method POST \
+  --authorization-type CUSTOM \
+  --authorizer-id $AUTHORIZER_ID \
+  --profile account-b
+
+# Get Presign URL Lambda ARN
+PRESIGN_ARN=$(aws lambda get-function \
+  --function-name file-whitelist-presign-url \
+  --query 'Configuration.FunctionArn' \
+  --output text \
+  --profile account-b)
+
+# Set up Lambda integration
+aws apigateway put-integration \
+  --rest-api-id $API_ID \
+  --resource-id $RESOURCE_ID \
+  --http-method POST \
+  --type AWS_PROXY \
+  --integration-http-method POST \
+  --uri "arn:aws:apigateway:REGION:lambda:path/2015-03-31/functions/$PRESIGN_ARN/invocations" \
+  --profile account-b
+
+# Grant API Gateway permission to invoke Presign URL Lambda
+aws lambda add-permission \
+  --function-name file-whitelist-presign-url \
+  --statement-id api-gateway-invoke \
+  --action lambda:InvokeFunction \
+  --principal apigateway.amazonaws.com \
+  --source-arn "arn:aws:execute-api:REGION:ACCOUNT_B_ID:$API_ID/*/*" \
+  --profile account-b
+```
+
+**6. Deploy API:**
+
+```bash
+# Create deployment
+aws apigateway create-deployment \
+  --rest-api-id $API_ID \
+  --stage-name prod \
+  --profile account-b
+
+# Get API Gateway URL
+API_URL="https://$API_ID.execute-api.REGION.amazonaws.com/prod"
+echo "API URL: $API_URL"
+```
+
+**7. Create API Gateway Invoke Role (if not exists):**
+
+API Gateway needs a role to invoke Lambda. Create it:
+
+```bash
+# Create trust policy
+cat > /tmp/trust-policy.json <<EOF
+{
+  "Version": "2012-10-17",
+  "Statement": [{
+    "Effect": "Allow",
+    "Principal": {
+      "Service": "apigateway.amazonaws.com"
+    },
+    "Action": "sts:AssumeRole"
+  }]
+}
+EOF
+
+# Create role
+aws iam create-role \
+  --role-name api-gateway-invoke-role \
+  --assume-role-policy-document file:///tmp/trust-policy.json \
+  --profile account-b
+
+# Attach policy to allow Lambda invocation
+aws iam attach-role-policy \
+  --role-name api-gateway-invoke-role \
+  --policy-arn arn:aws:iam::aws:policy/service-role/AWSLambdaRole \
+  --profile account-b
+```
+
+#### Option B: HTTP API (Simpler, Cheaper)
+
+**1. Create HTTP API:**
+
+```bash
+# Create HTTP API
+API_ID=$(aws apigatewayv2 create-api \
+  --name file-whitelist-api \
+  --protocol-type HTTP \
+  --cors-configuration AllowOrigins="*",AllowMethods="POST,OPTIONS",AllowHeaders="*" \
+  --profile account-b \
+  --query 'ApiId' \
+  --output text)
+
+echo "API ID: $API_ID"
+```
+
+**2. Create Lambda Authorizer:**
+
+```bash
+# Get authorizer Lambda ARN
+AUTHORIZER_ARN=$(aws lambda get-function \
+  --function-name file-whitelist-authorizer \
+  --query 'Configuration.FunctionArn' \
+  --output text \
+  --profile account-b)
+
+# Create authorizer
+AUTHORIZER_ID=$(aws apigatewayv2 create-authorizer \
+  --api-id $API_ID \
+  --authorizer-type REQUEST \
+  --authorizer-uri "arn:aws:apigateway:REGION:lambda:path/2015-03-31/functions/$AUTHORIZER_ARN/invocations" \
+  --identity-source '$request.header.Authorization' \
+  --authorizer-payload-format-version '2.0' \
+  --name file-whitelist-authorizer \
+  --profile account-b \
+  --query 'AuthorizerId' \
+  --output text)
+
+echo "Authorizer ID: $AUTHORIZER_ID"
+```
+
+**3. Create Route with Authorizer:**
+
+```bash
+# Get Presign URL Lambda ARN
+PRESIGN_ARN=$(aws lambda get-function \
+  --function-name file-whitelist-presign-url \
+  --query 'Configuration.FunctionArn' \
+  --output text \
+  --profile account-b)
+
+# Create integration
+INTEGRATION_ID=$(aws apigatewayv2 create-integration \
+  --api-id $API_ID \
+  --integration-type AWS_PROXY \
+  --integration-uri "arn:aws:apigateway:REGION:lambda:path/2015-03-31/functions/$PRESIGN_ARN/invocations" \
+  --payload-format-version '2.0' \
+  --profile account-b \
+  --query 'IntegrationId' \
+  --output text)
+
+# Create route with authorizer
+aws apigatewayv2 create-route \
+  --api-id $API_ID \
+  --route-key "POST /presign-url" \
+  --target "integrations/$INTEGRATION_ID" \
+  --authorization-type CUSTOM \
+  --authorizer-id $AUTHORIZER_ID \
+  --profile account-b
+
+# Grant API Gateway permission to invoke Presign URL Lambda
+aws lambda add-permission \
+  --function-name file-whitelist-presign-url \
+  --statement-id api-gateway-invoke \
+  --action lambda:InvokeFunction \
+  --principal apigateway.amazonaws.com \
+  --source-arn "arn:aws:execute-api:REGION:ACCOUNT_B_ID:$API_ID/*/*" \
+  --profile account-b
+```
+
+**4. Create Stage:**
+
+```bash
+# Create stage
+aws apigatewayv2 create-stage \
+  --api-id $API_ID \
+  --stage-name $default \
+  --auto-deploy \
+  --profile account-b
+
+# Get API Gateway URL
+API_URL="https://$API_ID.execute-api.REGION.amazonaws.com"
+echo "API URL: $API_URL"
+```
+
+**Note**: HTTP API uses `$default` stage automatically, but you can create custom stages.
+
+### Step 6: Grant API Gateway Permission to Invoke Authorizer
+
+For both REST API and HTTP API, ensure API Gateway can invoke the authorizer:
+
+```bash
+# Get API Gateway execution role ARN (or create one)
+API_GW_ROLE_ARN=$(aws iam get-role \
+  --role-name api-gateway-invoke-role \
+  --query 'Role.Arn' \
+  --output text \
+  --profile account-b 2>/dev/null || echo "")
+
+# If role doesn't exist, create it (see Step 5 REST API section)
+# Then grant permission
+aws lambda add-permission \
+  --function-name file-whitelist-authorizer \
+  --statement-id api-gateway-invoke-authorizer \
+  --action lambda:InvokeFunction \
+  --principal apigateway.amazonaws.com \
+  --source-arn "arn:aws:execute-api:REGION:ACCOUNT_B_ID:$API_ID/authorizers/$AUTHORIZER_ID" \
+  --profile account-b
+```
+
+### Step 7: Test API Gateway Endpoint
+
+After deployment, test the endpoint:
+
+```bash
+# 1. First, get a code from Account A
+CODE=$(aws lambda invoke \
+  --function-name file-whitelist-code-generator \
+  --payload '{"body": "{}"}' \
+  --profile account-a \
+  --query 'Payload' \
+  --output text | jq -r '.words')
+
+echo "Code: $CODE"
+
+# 2. Call API Gateway endpoint with Authorization header
+curl -X POST "$API_URL/presign-url" \
+  -H "Authorization: $CODE" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "action": "getPresignedUrl",
+    "contentType": "application/pdf",
+    "filename": "test.pdf"
+  }'
+```
+
+**Expected Response:**
+```json
+{
+  "url": "https://your-bucket.s3.region.amazonaws.com/uploads/123/..."
+}
+```
+
+### Step 8: Create IAM Role for STS AssumeRole (Account B)
 
 Create a minimal S3 role:
 
@@ -465,7 +779,7 @@ Allow Presign URL Lambda to assume this role:
 }
 ```
 
-### Step 6: Deploy Presign URL Lambda (Account B)
+### Step 10: Deploy Presign URL Lambda (Account B)
 
 ```bash
 cd presign_url
