@@ -1,247 +1,288 @@
 # File Whitelisting Interface - AWS Lambda Backend
 
-A production-grade backend system for secure file upload workflows using AWS Lambda, API Gateway, DynamoDB, S3, and KMS.
+A production-grade backend system for secure file upload workflows using AWS Lambda, API Gateway, DynamoDB, S3, and KMS with **pure cryptographic validation**.
 
 ## Architecture Overview
 
 This system implements a secure three-step flow for file uploads across **two AWS accounts**:
 
-- **Account A**: Code Generator Lambda (generates signed codes)
-- **Account B**: Authorizer Lambda + Presign URL Lambda (validates codes and generates S3 URLs)
+- **Account A**: Code Generator Lambda (generates word-based signed codes)
+- **Account B**: Authorizer Lambda + Presign URL Lambda (validates codes cryptographically and generates S3 URLs)
 
 ### Two-Account Architecture
 
 ```
 Account A (Code Generation):
 ├── Code Generator Lambda
-└── DynamoDB Table (shared with Account B)
+└── DynamoDB Table (only for daily counter)
 
 Account B (Authorization & Upload):
-├── Authorizer Lambda
-├── Presign URL Lambda
+├── Authorizer Lambda (pure cryptographic validation - no DynamoDB)
+├── Presign URL Lambda (STS AssumeRole + multipart support)
 └── S3 Bucket (for file uploads)
 ```
 
 ### Flow Diagram
 
 ```
-1. Client → Code Generator Lambda (Account A) → DynamoDB (store code metadata)
+1. Client → Code Generator Lambda (Account A) 
+   → DynamoDB (increment daily counter)
+   → KMS (generate MAC: counter|date|hours)
+   → Encode as 10 words
+   → Returns: "word0001 word0023 ... word0999"
                                         ↓
-                                   Returns code + signature
+2. Client → Authorizer Lambda (Account B)
+   → Decode words to bits
+   → Regenerate MAC with KMS (try hours within TTL window)
+   → Validate signature + check TTL
+   → Return allow/deny (stateless - no DynamoDB needed!)
                                         ↓
-2. Client → Authorizer Lambda (Account B) → DynamoDB (validate code)
-                                          ↓
-                                     Verify signature (HMAC/KMS)
-                                          ↓
-                                     Return allow/deny
-                                        ↓
-3. Client → Presign URL Lambda (Account B) → S3 (generate presigned URL)
-                                          ↓
-                                     Returns presigned URL
+3. Client → Presign URL Lambda (Account B)
+   → STS AssumeRole (temporary S3 credentials)
+   → Generate presigned URL (single-part or multipart)
+   → Returns presigned URL
                                         ↓
 4. Client → S3 (upload file using presigned URL)
 ```
+
+## Key Features
+
+- **Word-Based Codes**: User-friendly codes (10 words) instead of hex/base64
+- **Pure Cryptographic Validation**: No DynamoDB lookup needed for validation (stateless)
+- **STS AssumeRole**: More secure S3 access using temporary credentials
+- **Multipart Upload Support**: Handles large files efficiently
+- **Daily Counter**: Prevents code reuse with daily counter
+- **TTL Validation**: Configurable expiration (hours-based)
 
 ## Components
 
 ### 1. Code Generator Lambda (`code_generator/`) - Account A
 
-**Purpose**: Generates cryptographically signed codes with expiration.
+**Purpose**: Generates KMS-signed codes using word-based encoding.
+
+**How it works**:
+1. Increments daily counter in DynamoDB (counterId: `code-count-YYYY-MM-DD`)
+2. Builds message: `counter|date|hours_since_epoch`
+3. Generates MAC using KMS HMAC_SHA_256
+4. Encodes 100 bits (10-bit counter + 90-bit MAC) as 10 words
+5. Returns space-separated words
 
 **Features**:
-- HMAC-SHA256 or AWS KMS signing
-- Stores metadata in DynamoDB with TTL
-- Configurable expiration time
-- Standalone function (no shared dependencies)
+- KMS HMAC_SHA_256 signing
+- Daily counter prevents reuse
+- Word-based encoding (user-friendly)
+- Configurable TTL (hours)
 
 **Input**: None (POST request)
 
 **Output**:
 ```json
 {
-  "code": "abc123...",
-  "signature": "signature_hex_or_base64",
-  "expires_at": 1234567890,
-  "expires_in_minutes": 60,
-  "signing_method": "HMAC" | "KMS"
+  "words": "word0001 word0023 word0456 word0789 word0123 word0456 word0789 word0123 word0456 word0789",
+  "expires_in_hours": 24
 }
 ```
 
+**Environment Variables**:
+- `KMS_KEY_ID` (required): KMS key ID or ARN
+- `DYNAMODB_TABLE_NAME` (optional): Table for counter (default: `file-whitelist-codes`)
+- `CODE_EXPIRY_HOURS` (optional): TTL in hours (default: 24)
+
 ### 2. Authorizer Lambda (`authorizer/`) - Account B
 
-**Purpose**: Validates codes and signatures before allowing requests.
+**Purpose**: Validates codes using pure cryptographic validation (no DynamoDB).
+
+**How it works**:
+1. Decodes 10 words back to 100 bits
+2. Extracts counter (10 bits) and MAC (90 bits)
+3. Tries regenerating MAC with hours within TTL window
+4. Compares MACs - if match found within TTL, code is valid
+5. Returns IAM policy (for API Gateway) or validation result
 
 **Features**:
+- **Stateless validation** - no DynamoDB needed
+- Pure cryptographic verification
+- TTL checking (hours-based)
+- Clock skew tolerance
 - Dual mode: API Gateway authorizer or standalone endpoint
-- Signature verification (HMAC or KMS)
-- TTL and state validation
-- DynamoDB consistency checks
-- Standalone function (no shared dependencies)
 
 **Input** (Standalone mode):
 ```json
 {
-  "code": "abc123...",
-  "signature": "signature..."
+  "words": "word0001 word0023 ... word0999"
 }
 ```
 
+Or via header:
+```
+X-Authorization-Words: word0001 word0023 ... word0999
+```
+
 **Input** (Authorizer mode):
-- `authorizationToken`: `"code:signature"` format in Authorization header
+- `authorizationToken`: Words string in Authorization header
 
 **Output** (Standalone mode):
 ```json
 {
   "valid": true,
-  "message": "Code is valid"
+  "message": "Code is valid",
+  "key_id": 123
 }
 ```
 
 **Output** (Authorizer mode):
 - IAM policy document for API Gateway
 
+**Environment Variables**:
+- `KMS_KEY_ID` (required): KMS key ID or ARN (must match Account A)
+- `CODE_EXPIRY_HOURS` (optional): TTL in hours (default: 24, must match Account A)
+- `API_GW_ARN` (optional): API Gateway ARN for policy (default: `*`)
+
 ### 3. Presign URL Lambda (`presign_url/`) - Account B
 
-**Purpose**: Generates presigned S3 URLs for authorized file uploads.
+**Purpose**: Generates presigned S3 URLs using STS AssumeRole for better security.
 
 **Features**:
-- Presigned POST URLs with conditions
+- **STS AssumeRole**: Temporary credentials (more secure than direct presigned URLs)
+- **Multipart upload support**: For large files
+- **Single-part upload**: For smaller files
 - Content type validation
 - File size limits
-- Organized S3 key structure
-- Standalone function (no shared dependencies)
 
 **Input**:
 ```json
 {
-  "filename": "example.pdf",  // Optional
-  "content_type": "application/pdf"  // Optional
+  "action": "getPresignedUrl" | "createMultipartUpload" | "getSignedUrlForPart" | "listParts" | "completeMultipartUpload" | "abortMultipartUpload",
+  "key": "uploads/123/filename.pdf",  // Optional, auto-generated if not provided
+  "contentType": "application/pdf",    // Required for uploads
+  "filename": "document.pdf",          // Optional, used for key generation
+  "uploadId": "...",                   // Required for multipart operations
+  "partNumber": 1,                     // Required for getSignedUrlForPart
+  "parts": [...]                       // Required for completeMultipartUpload
 }
 ```
 
-**Output**:
+**Output** (single-part):
 ```json
 {
-  "presigned_url": "https://s3.amazonaws.com/...",
-  "fields": {
-    "key": "...",
-    "AWSAccessKeyId": "...",
-    "policy": "...",
-    "signature": "..."
-  },
-  "method": "POST",
-  "expires_in_seconds": 3600,
-  "max_file_size_mb": 100,
-  "bucket": "your-bucket-name"
+  "url": "https://s3.amazonaws.com/bucket/..."
 }
 ```
+
+**Output** (multipart create):
+```json
+{
+  "uploadId": "abc123...",
+  "key": "uploads/123/filename.pdf"
+}
+```
+
+**Output** (multipart part):
+```json
+{
+  "url": "https://s3.amazonaws.com/bucket/...?uploadId=..."
+}
+```
+
+**Environment Variables**:
+- `UPLOAD_BUCKET_NAME` (required): S3 bucket name
+- `MINIMAL_S3_ROLE_ARN` (required): IAM role ARN for STS AssumeRole
+- `ALLOWED_CONTENT_TYPES` (optional): Comma-separated list (default: `*/*`)
+- `MAX_FILE_SIZE_MB` (optional): Max file size in MB (default: 5000)
 
 ## Prerequisites
 
 - Two AWS Accounts (Account A and Account B)
 - AWS CLI configured with credentials for both accounts
 - Python 3.11
-- Access to create Lambda functions, DynamoDB tables, S3 buckets, and IAM roles
+- KMS key with `GenerateMac` and `VerifyMac` permissions (shared or cross-account access)
+- S3 bucket in Account B
+- IAM role for STS AssumeRole (in Account B)
 
 ## AWS Resources Required
-
-### Shared Resources (must be accessible from both accounts)
-
-#### DynamoDB Table
-- **Table Name**: `file-whitelist-codes` (configurable)
-- **Partition Key**: `code` (String)
-- **TTL Attribute**: `ttl` (Number)
-- **Billing Mode**: Pay-per-request (recommended)
-- **Cross-Account Access**: Account B needs read access to this table
 
 ### Account A Resources
 
 - **Code Generator Lambda Function**
-- **DynamoDB Table** (or access to shared table)
-- **KMS Key** (optional, if using KMS signing)
-- **IAM Role** for Lambda with DynamoDB write permissions
+- **DynamoDB Table**: For daily counter only
+  - Table name: `file-whitelist-codes` (configurable)
+  - Partition key: `counterId` (String)
+  - Billing mode: Pay-per-request
+- **KMS Key**: For code signing
+  - Key usage: `GenerateMac`
+  - Algorithm: `HMAC_SHA_256`
+  - Must be accessible from Account B (or shared)
 
 ### Account B Resources
 
 - **Authorizer Lambda Function**
 - **Presign URL Lambda Function**
-- **S3 Bucket** for file uploads
-- **API Gateway** (optional, for HTTP endpoints)
-- **IAM Roles** for Lambda functions
+- **S3 Bucket**: For file uploads
+- **IAM Role**: For STS AssumeRole (minimal S3 permissions)
+- **KMS Key Access**: Read access to same KMS key as Account A
+- **API Gateway** (optional): For HTTP endpoints
 
-## Environment Variables
+## Environment Variables Summary
 
 ### Code Generator Lambda (Account A)
 
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
-| `DYNAMODB_TABLE_NAME` | Yes | - | DynamoDB table name |
-| `USE_KMS` | No | `false` | Use KMS for signing (`true`/`false`) |
-| `KMS_KEY_ID` | If USE_KMS=true | - | KMS key ID or ARN |
-| `HMAC_SECRET` | If USE_KMS=false | - | Secret key for HMAC signing |
-| `CODE_EXPIRY_MINUTES` | No | `60` | Code expiration in minutes |
+| `KMS_KEY_ID` | Yes | - | KMS key ID or ARN |
+| `DYNAMODB_TABLE_NAME` | No | `file-whitelist-codes` | DynamoDB table for counter |
+| `CODE_EXPIRY_HOURS` | No | `24` | Code expiration in hours |
 
 ### Authorizer Lambda (Account B)
 
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
-| `DYNAMODB_TABLE_NAME` | Yes | - | DynamoDB table name (must match Account A) |
-| `USE_KMS` | No | `false` | Use KMS for signing (`true`/`false`) |
-| `KMS_KEY_ID` | If USE_KMS=true | - | KMS key ID or ARN (must match Account A) |
-| `HMAC_SECRET` | If USE_KMS=false | - | Secret key for HMAC signing (must match Account A) |
+| `KMS_KEY_ID` | Yes | - | KMS key ID or ARN (must match Account A) |
+| `CODE_EXPIRY_HOURS` | No | `24` | TTL in hours (must match Account A) |
+| `API_GW_ARN` | No | `*` | API Gateway ARN for policy |
 
 ### Presign URL Lambda (Account B)
 
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
-| `S3_BUCKET_NAME` | Yes | - | S3 bucket name for uploads |
-| `PRESIGNED_URL_EXPIRY_SECONDS` | No | `3600` | URL expiration in seconds |
-| `ALLOWED_CONTENT_TYPES` | No | `*/*` | Comma-separated list of allowed content types |
-| `MAX_FILE_SIZE_MB` | No | `100` | Maximum file size in MB |
+| `UPLOAD_BUCKET_NAME` | Yes | - | S3 bucket name |
+| `MINIMAL_S3_ROLE_ARN` | Yes | - | IAM role ARN for STS AssumeRole |
+| `ALLOWED_CONTENT_TYPES` | No | `*/*` | Comma-separated allowed types |
+| `MAX_FILE_SIZE_MB` | No | `5000` | Maximum file size in MB |
 
 ## Deployment
 
-### Step 1: Create DynamoDB Table (Shared)
+### Step 1: Create DynamoDB Table (Account A)
 
-Create the table in Account A (or a shared account):
+Only needed for daily counter:
 
 ```bash
 aws dynamodb create-table \
   --table-name file-whitelist-codes \
-  --attribute-definitions AttributeName=code,AttributeType=S \
-  --key-schema AttributeName=code,KeyType=HASH \
+  --attribute-definitions AttributeName=counterId,AttributeType=S \
+  --key-schema AttributeName=counterId,KeyType=HASH \
   --billing-mode PAY_PER_REQUEST \
-  --time-to-live-specification Enabled=true,AttributeName=ttl \
   --profile account-a
 ```
 
-### Step 2: Set Up Cross-Account Access (Account B → DynamoDB)
+### Step 2: Create KMS Key (Shared or Cross-Account)
 
-Create a policy in Account A to allow Account B to read from DynamoDB:
+Create KMS key with HMAC_SHA_256 support:
 
 ```bash
-# In Account A, create a policy document (dynamodb-policy.json)
-cat > dynamodb-policy.json << EOF
-{
-  "Version": "2012-10-17",
-  "Statement": [{
-    "Effect": "Allow",
-    "Principal": {
-      "AWS": "arn:aws:iam::ACCOUNT_B_ID:root"
-    },
-    "Action": [
-      "dynamodb:GetItem",
-      "dynamodb:Query"
-    ],
-    "Resource": "arn:aws:dynamodb:REGION:ACCOUNT_A_ID:table/file-whitelist-codes"
-  }]
-}
-EOF
+# In Account A
+aws kms create-key \
+  --description "File whitelist code signing" \
+  --key-spec HMAC_256 \
+  --key-usage GENERATE_VERIFY_MAC \
+  --profile account-a
 
-# Attach to DynamoDB table (requires AWS CLI or console)
+# Grant Account B access (or use shared key)
+aws kms create-grant \
+  --key-id <KEY_ID> \
+  --grantee-principal arn:aws:iam::ACCOUNT_B_ID:root \
+  --operations GenerateMac VerifyMac \
+  --profile account-a
 ```
-
-Alternatively, use resource-based policies or IAM role assumption.
 
 ### Step 3: Deploy Code Generator Lambda (Account A)
 
@@ -252,7 +293,7 @@ cd code_generator
 pip install boto3 -t .
 
 # Create deployment package
-zip -r ../code_generator.zip .
+zip -r ../code_generator.zip . -x "*.pyc" "__pycache__/*"
 
 # Create Lambda function
 aws lambda create-function \
@@ -262,17 +303,10 @@ aws lambda create-function \
   --handler lambda_function.lambda_handler \
   --zip-file fileb://../code_generator.zip \
   --environment Variables="{
+    KMS_KEY_ID=arn:aws:kms:region:ACCOUNT_A_ID:key/KEY_ID,
     DYNAMODB_TABLE_NAME=file-whitelist-codes,
-    USE_KMS=false,
-    HMAC_SECRET=your-secret-here,
-    CODE_EXPIRY_MINUTES=60
+    CODE_EXPIRY_HOURS=24
   }" \
-  --profile account-a
-
-# Create API Gateway endpoint (optional)
-aws apigatewayv2 create-api \
-  --name file-whitelist-api \
-  --protocol-type HTTP \
   --profile account-a
 ```
 
@@ -285,7 +319,7 @@ cd authorizer
 pip install boto3 -t .
 
 # Create deployment package
-zip -r ../authorizer.zip .
+zip -r ../authorizer.zip . -x "*.pyc" "__pycache__/*"
 
 # Create Lambda function
 aws lambda create-function \
@@ -295,14 +329,54 @@ aws lambda create-function \
   --handler lambda_function.lambda_handler \
   --zip-file fileb://../authorizer.zip \
   --environment Variables="{
-    DYNAMODB_TABLE_NAME=file-whitelist-codes,
-    USE_KMS=false,
-    HMAC_SECRET=your-secret-here
+    KMS_KEY_ID=arn:aws:kms:region:ACCOUNT_A_ID:key/KEY_ID,
+    CODE_EXPIRY_HOURS=24,
+    API_GW_ARN=arn:aws:execute-api:region:ACCOUNT_B_ID:api-id/*/*
   }" \
   --profile account-b
 ```
 
-### Step 5: Deploy Presign URL Lambda (Account B)
+### Step 5: Create IAM Role for STS AssumeRole (Account B)
+
+Create a minimal S3 role:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": [
+        "s3:PutObject",
+        "s3:PutObjectAcl",
+        "s3:CreateMultipartUpload",
+        "s3:UploadPart",
+        "s3:CompleteMultipartUpload",
+        "s3:AbortMultipartUpload",
+        "s3:ListParts"
+      ],
+      "Resource": "arn:aws:s3:::your-upload-bucket/*"
+    }
+  ]
+}
+```
+
+Allow Presign URL Lambda to assume this role:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [{
+    "Effect": "Allow",
+    "Principal": {
+      "Service": "lambda.amazonaws.com"
+    },
+    "Action": "sts:AssumeRole"
+  }]
+}
+```
+
+### Step 6: Deploy Presign URL Lambda (Account B)
 
 ```bash
 cd presign_url
@@ -311,7 +385,7 @@ cd presign_url
 pip install boto3 -t .
 
 # Create deployment package
-zip -r ../presign_url.zip .
+zip -r ../presign_url.zip . -x "*.pyc" "__pycache__/*"
 
 # Create Lambda function
 aws lambda create-function \
@@ -321,39 +395,13 @@ aws lambda create-function \
   --handler lambda_function.lambda_handler \
   --zip-file fileb://../presign_url.zip \
   --environment Variables="{
-    S3_BUCKET_NAME=your-upload-bucket,
-    PRESIGNED_URL_EXPIRY_SECONDS=3600,
+    UPLOAD_BUCKET_NAME=your-upload-bucket,
+    MINIMAL_S3_ROLE_ARN=arn:aws:iam::ACCOUNT_B_ID:role/minimal-s3-role,
     ALLOWED_CONTENT_TYPES=*/*,
-    MAX_FILE_SIZE_MB=100
+    MAX_FILE_SIZE_MB=5000
   }" \
   --profile account-b
 ```
-
-### Step 6: Create S3 Bucket (Account B)
-
-```bash
-aws s3 mb s3://your-upload-bucket --profile account-b
-
-aws s3api put-bucket-encryption \
-  --bucket your-upload-bucket \
-  --server-side-encryption-configuration '{
-    "Rules": [{
-      "ApplyServerSideEncryptionByDefault": {
-        "SSEAlgorithm": "AES256"
-      }
-    }]
-  }' \
-  --profile account-b
-```
-
-### Step 7: Configure API Gateway (Account B)
-
-If using API Gateway, configure the authorizer:
-
-1. Create API Gateway REST API or HTTP API
-2. Set up Lambda authorizer pointing to `file-whitelist-authorizer`
-3. Configure `/presign-url` endpoint with authorizer
-4. Deploy API
 
 ## IAM Roles Required
 
@@ -375,7 +423,7 @@ If using API Gateway, configure the authorizer:
     {
       "Effect": "Allow",
       "Action": [
-        "dynamodb:PutItem",
+        "dynamodb:UpdateItem",
         "dynamodb:GetItem"
       ],
       "Resource": "arn:aws:dynamodb:*:*:table/file-whitelist-codes"
@@ -383,8 +431,7 @@ If using API Gateway, configure the authorizer:
     {
       "Effect": "Allow",
       "Action": [
-        "kms:Sign",
-        "kms:DescribeKey"
+        "kms:GenerateMac"
       ],
       "Resource": "arn:aws:kms:*:*:key/*"
     }
@@ -410,22 +457,15 @@ If using API Gateway, configure the authorizer:
     {
       "Effect": "Allow",
       "Action": [
-        "dynamodb:GetItem",
-        "dynamodb:Query"
-      ],
-      "Resource": "arn:aws:dynamodb:*:*:table/file-whitelist-codes"
-    },
-    {
-      "Effect": "Allow",
-      "Action": [
-        "kms:Verify",
-        "kms:DescribeKey"
+        "kms:GenerateMac"
       ],
       "Resource": "arn:aws:kms:*:*:key/*"
     }
   ]
 }
 ```
+
+Note: **No DynamoDB permissions needed** - pure cryptographic validation!
 
 ### Account B - Presign URL Lambda Role
 
@@ -445,10 +485,9 @@ If using API Gateway, configure the authorizer:
     {
       "Effect": "Allow",
       "Action": [
-        "s3:PutObject",
-        "s3:PutObjectAcl"
+        "sts:AssumeRole"
       ],
-      "Resource": "arn:aws:s3:::your-upload-bucket/*"
+      "Resource": "arn:aws:iam::ACCOUNT_B_ID:role/minimal-s3-role"
     }
   ]
 }
@@ -459,7 +498,6 @@ If using API Gateway, configure the authorizer:
 ### Test Code Generator (Account A)
 
 ```bash
-# Invoke directly
 aws lambda invoke \
   --function-name file-whitelist-code-generator \
   --payload '{"body": "{}"}' \
@@ -467,6 +505,7 @@ aws lambda invoke \
   response.json
 
 cat response.json
+# Output: {"words": "word0001 word0023 ... word0999", "expires_in_hours": 24}
 ```
 
 ### Test Authorizer (Account B)
@@ -475,90 +514,114 @@ cat response.json
 # Standalone validation
 aws lambda invoke \
   --function-name file-whitelist-authorizer \
-  --payload '{"body": "{\"code\": \"your_code\", \"signature\": \"your_signature\"}"}' \
+  --payload '{"body": "{\"words\": \"word0001 word0023 word0456 word0789 word0123 word0456 word0789 word0123 word0456 word0789\"}"}' \
   --profile account-b \
   response.json
+
+cat response.json
 ```
 
 ### Test Presign URL (Account B)
 
+**Single-part upload:**
 ```bash
 aws lambda invoke \
   --function-name file-whitelist-presign-url \
-  --payload '{"requestContext": {"authorizer": {"principalId": "your_code"}}, "body": "{\"filename\": \"test.pdf\"}"}' \
+  --payload '{
+    "requestContext": {"authorizer": {"principalId": "123"}},
+    "body": "{\"action\": \"getPresignedUrl\", \"contentType\": \"application/pdf\", \"filename\": \"test.pdf\"}"
+  }' \
   --profile account-b \
   response.json
 ```
 
-## Testing via API Gateway
-
-### 1. Generate Code (Account A)
-
+**Multipart upload:**
 ```bash
-curl -X POST https://api-account-a.execute-api.region.amazonaws.com/generate-code \
-  -H "Content-Type: application/json" \
-  -d '{}'
-```
+# 1. Create multipart upload
+aws lambda invoke \
+  --function-name file-whitelist-presign-url \
+  --payload '{
+    "requestContext": {"authorizer": {"principalId": "123"}},
+    "body": "{\"action\": \"createMultipartUpload\", \"contentType\": \"application/pdf\", \"filename\": \"large.pdf\"}"
+  }' \
+  --profile account-b \
+  response.json
 
-### 2. Get Presigned URL (Account B)
+# 2. Get signed URL for part 1
+aws lambda invoke \
+  --function-name file-whitelist-presign-url \
+  --payload '{
+    "requestContext": {"authorizer": {"principalId": "123"}},
+    "body": "{\"action\": \"getSignedUrlForPart\", \"key\": \"uploads/123/large.pdf\", \"uploadId\": \"...\", \"partNumber\": 1}"
+  }' \
+  --profile account-b \
+  response.json
 
-```bash
-curl -X POST https://api-account-b.execute-api.region.amazonaws.com/presign-url \
-  -H "Authorization: code:signature" \
-  -H "Content-Type: application/json" \
-  -d '{"filename": "document.pdf", "content_type": "application/pdf"}'
+# 3. Complete multipart upload
+aws lambda invoke \
+  --function-name file-whitelist-presign-url \
+  --payload '{
+    "requestContext": {"authorizer": {"principalId": "123"}},
+    "body": "{\"action\": \"completeMultipartUpload\", \"key\": \"uploads/123/large.pdf\", \"uploadId\": \"...\", \"parts\": [{\"PartNumber\": 1, \"ETag\": \"...\"}]}"
+  }' \
+  --profile account-b \
+  response.json
 ```
 
 ## Security Considerations
 
-1. **HMAC Secret**: Store in AWS Secrets Manager (same secret in both accounts)
-2. **KMS Keys**: Use KMS for production (same key in both accounts or cross-account access)
-3. **Cross-Account Access**: Use IAM roles with least privilege
-4. **DynamoDB**: Enable encryption at rest, restrict access via IAM
-5. **S3 Bucket**: Block public access, use bucket policies
-6. **Code Expiration**: Keep expiration times short (recommended: 60 minutes)
+1. **KMS Keys**: Use KMS for all code signing (same key in both accounts or cross-account access)
+2. **STS AssumeRole**: More secure than direct presigned URLs (temporary credentials)
+3. **No DynamoDB for Validation**: Stateless validation prevents database tampering
+4. **Word-Based Codes**: User-friendly but still cryptographically secure
+5. **TTL Enforcement**: Hours-based expiration with clock skew tolerance
+6. **S3 Bucket**: Block public access, use bucket policies
 7. **Rate Limiting**: Implement at API Gateway level
 8. **CORS**: Configure appropriately for your frontend
 
 ## Important Notes
 
-- **Shared Secrets**: HMAC_SECRET or KMS_KEY_ID must be identical in Account A and Account B
-- **DynamoDB Access**: Account B needs read access to the table in Account A
-- **No Shared Code**: Each Lambda is standalone - no shared dependencies
-- **Cross-Account Setup**: Requires proper IAM policies for cross-account DynamoDB access
+- **Shared KMS Key**: Must be accessible from both Account A and Account B
+- **No Cross-Account DynamoDB**: Authorizer doesn't need DynamoDB access (pure cryptographic)
+- **Counter Table**: Only needed in Account A for daily counter
+- **Word Format**: Codes are 10 space-separated words (e.g., `word0001 word0023 ...`)
+- **TTL Matching**: `CODE_EXPIRY_HOURS` must match in Account A and Account B
 
 ## Directory Structure
 
 ```
 lambda-functions/
 ├── code_generator/
-│   └── lambda_function.py          # Standalone (Account A)
+│   ├── lambda_function.py
+│   └── dictionary.py          # Word encoding/decoding
 ├── authorizer/
-│   └── lambda_function.py          # Standalone (Account B)
+│   ├── lambda_function.py
+│   └── dictionary.py          # Word decoding
 ├── presign_url/
-│   └── lambda_function.py          # Standalone (Account B)
-├── events/                          # Example event files
-├── requirements.txt                 # Python dependencies
-└── README.md                        # This file
+│   └── lambda_function.py     # STS AssumeRole + multipart
+├── events/                     # Example event files
+├── requirements.txt
+└── README.md
 ```
 
 ## Troubleshooting
 
 ### Code Generation Fails
 - Check DynamoDB table exists in Account A
-- Verify Lambda role has DynamoDB write permissions
-- Check HMAC_SECRET or KMS_KEY_ID is set correctly
+- Verify Lambda role has DynamoDB UpdateItem permission
+- Check KMS_KEY_ID is correct and has GenerateMac permission
 
 ### Authorization Fails
-- Verify code hasn't expired
-- Check signature matches (same HMAC_SECRET or KMS key in both accounts)
-- Ensure DynamoDB item exists and state is "active"
-- Verify Account B has read access to DynamoDB table in Account A
+- Verify words format is correct (10 space-separated words)
+- Check KMS key is accessible from Account B
+- Ensure CODE_EXPIRY_HOURS matches in both accounts
+- Check code hasn't expired (within TTL window)
 
 ### Presigned URL Fails
 - Check S3 bucket exists in Account B
-- Verify Lambda role has S3 PutObject permission
-- Check bucket name is correct in environment variables
+- Verify MINIMAL_S3_ROLE_ARN is correct
+- Ensure Lambda role can AssumeRole
+- Check bucket name is correct
 
 ## License
 

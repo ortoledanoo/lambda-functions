@@ -1,21 +1,20 @@
 """
 Code Generator Lambda Function (Account A).
 
-Generates HMAC or KMS-signed codes with expiry and stores metadata in DynamoDB.
+Generates KMS-signed codes with expiry using word-based encoding.
+Uses daily counter + date + timestamp for uniqueness and TTL validation.
 This Lambda runs in Account A (separate from authorizer/presign functions).
 """
 import os
 import json
 import logging
-import secrets
-import hashlib
-import hmac
-import base64
-from typing import Dict, Any, Optional
+from typing import Dict, Any
 from datetime import datetime, timezone
 
 import boto3
 from botocore.exceptions import ClientError
+
+from dictionary import encode_bits_to_words
 
 # Setup logger
 logger = logging.getLogger(__name__)
@@ -27,27 +26,83 @@ if not logger.handlers:
     logger.addHandler(handler)
 
 # Initialize AWS clients
-dynamodb = boto3.resource('dynamodb')
+dynamodb = boto3.client('dynamodb')
 kms_client = boto3.client('kms')
 
-# Configuration from environment variables
-def get_env_var(key: str, default: Optional[str] = None) -> str:
-    """Get environment variable with optional default."""
-    value = os.environ.get(key, default)
-    if value is None:
-        raise ValueError(f"Environment variable {key} is required but not set")
-    return value
-
-DYNAMODB_TABLE_NAME = get_env_var('DYNAMODB_TABLE_NAME')
+# Configuration
+DYNAMODB_TABLE_NAME = os.environ.get('DYNAMODB_TABLE_NAME', 'file-whitelist-codes')
 KMS_KEY_ID = os.environ.get('KMS_KEY_ID')
-CODE_EXPIRY_MINUTES = int(os.environ.get('CODE_EXPIRY_MINUTES', '60'))
-USE_KMS = os.environ.get('USE_KMS', 'false').lower() == 'true'
-HMAC_SECRET = os.environ.get('HMAC_SECRET')
+if not KMS_KEY_ID:
+    raise ValueError("KMS_KEY_ID environment variable is required")
+
+CODE_EXPIRY_HOURS = int(os.environ.get('CODE_EXPIRY_HOURS', '24'))
 
 
-def get_current_timestamp() -> int:
-    """Get current UTC timestamp as integer."""
-    return int(datetime.now(timezone.utc).timestamp())
+def get_utc_date_string() -> str:
+    """Get UTC date string (YYYY-MM-DD)."""
+    return datetime.now(timezone.utc).strftime('%Y-%m-%d')
+
+
+def build_counter_id() -> str:
+    """Build counter ID for today: code-count-yyyy-mm-dd."""
+    date_str = get_utc_date_string()
+    return f"code-count-{date_str}"
+
+
+def update_counter() -> int:
+    """
+    Increment daily counter in DynamoDB and return new count.
+    
+    Returns:
+        New counter value
+    """
+    counter_id = build_counter_id()
+    try:
+        response = dynamodb.update_item(
+            TableName=DYNAMODB_TABLE_NAME,
+            Key={'counterId': {'S': counter_id}},
+            UpdateExpression='SET #c = if_not_exists(#c, :start) + :inc',
+            ExpressionAttributeNames={'#c': 'count'},
+            ExpressionAttributeValues={
+                ':inc': {'N': '1'},
+                ':start': {'N': '0'}
+            },
+            ReturnValues='UPDATED_NEW'
+        )
+        new_count = int(response['Attributes']['count']['N'])
+        return new_count
+    except ClientError as e:
+        logger.error(f"Error incrementing counter: {e}")
+        raise
+
+
+def get_current_hours() -> int:
+    """Get current hours since epoch."""
+    return int(datetime.now(timezone.utc).timestamp() / 3600)
+
+
+def generate_mac(message: str) -> bytes:
+    """
+    Generate MAC using KMS HMAC_SHA_256.
+    
+    Args:
+        message: Message to sign
+        
+    Returns:
+        MAC bytes (first 96 bits used)
+    """
+    try:
+        response = kms_client.generate_mac(
+            KeyId=KMS_KEY_ID,
+            Message=message.encode('utf-8'),
+            MacAlgorithm='HMAC_SHA_256'
+        )
+        if not response.get('Mac'):
+            raise ValueError("KMS did not return a MAC")
+        return response['Mac']
+    except ClientError as e:
+        logger.error(f"KMS MAC generation failed: {e}")
+        raise
 
 
 def create_response(status_code: int, body: Dict[str, Any]) -> Dict[str, Any]:
@@ -62,100 +117,42 @@ def create_response(status_code: int, body: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def generate_nonce() -> str:
-    """Generate a cryptographically secure random nonce."""
-    return secrets.token_urlsafe(32)
-
-
-def sign_with_hmac(code: str, secret: str) -> str:
-    """Sign a code using HMAC-SHA256."""
-    signature = hmac.new(
-        secret.encode('utf-8'),
-        code.encode('utf-8'),
-        hashlib.sha256
-    ).hexdigest()
-    return signature
-
-
-def sign_with_kms(code: str, key_id: str) -> str:
-    """Sign a code using AWS KMS."""
-    try:
-        response = kms_client.sign(
-            KeyId=key_id,
-            Message=code.encode('utf-8'),
-            MessageType='RAW',
-            SigningAlgorithm='RSASSA_PSS_SHA_256'
-        )
-        return base64.b64encode(response['Signature']).decode('utf-8')
-    except ClientError as e:
-        logger.error(f"KMS signing failed: {e}")
-        raise
-
-
-def generate_code(nonce: str, timestamp: int) -> str:
-    """Generate a code from nonce and timestamp."""
-    code_data = f"{nonce}:{timestamp}"
-    return hashlib.sha256(code_data.encode('utf-8')).hexdigest()[:32]
-
-
-def store_code_metadata(code: str, signature: str, expires_at: int, nonce: str) -> None:
-    """Store code metadata in DynamoDB."""
-    table = dynamodb.Table(DYNAMODB_TABLE_NAME)
-    try:
-        table.put_item(
-            Item={
-                'code': code,
-                'signature': signature,
-                'expires_at': expires_at,
-                'nonce': nonce,
-                'created_at': get_current_timestamp(),
-                'state': 'active',
-                'ttl': expires_at
-            },
-            ConditionExpression='attribute_not_exists(code)'
-        )
-        logger.info(f"Stored code metadata for code: {code[:8]}...")
-    except ClientError as e:
-        logger.error(f"Failed to store code metadata: {e}")
-        raise
-
-
 def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     """Lambda handler for code generation."""
     try:
         logger.info("Code generator Lambda invoked")
         
-        if not USE_KMS and not HMAC_SECRET:
-            logger.error("Either USE_KMS must be true or HMAC_SECRET must be set")
-            return create_response(500, {'error': 'Configuration error'})
+        # Update counter
+        key_id = update_counter()
+        if key_id < 0 or key_id > 1023:
+            return create_response(400, {'error': 'Invalid keyId generated'})
         
-        # Generate code
-        nonce = generate_nonce()
-        timestamp = get_current_timestamp()
-        code = generate_code(nonce, timestamp)
-        expires_at = timestamp + (CODE_EXPIRY_MINUTES * 60)
+        # Build message: counter (10 bits) | date | hours since epoch
+        key_id_bits = f"{key_id:010b}"
+        date = get_utc_date_string()
+        hours = get_current_hours()
+        message = f"{key_id_bits}|{date}|{hours}"
         
-        # Sign the code
-        if USE_KMS and KMS_KEY_ID:
-            signature = sign_with_kms(code, KMS_KEY_ID)
-            signing_method = 'KMS'
-        else:
-            signature = sign_with_hmac(code, HMAC_SECRET)
-            signing_method = 'HMAC'
+        # Generate MAC
+        mac_result = generate_mac(message)
         
-        # Store in DynamoDB
-        store_code_metadata(code, signature, expires_at, nonce)
+        # Use first 96 bits (12 bytes) of MAC
+        mac_bytes = mac_result[:12]
+        mac_bits = ''.join(f"{b:08b}" for b in mac_bytes)[:90]  # 90 bits
         
-        response_body = {
-            'code': code,
-            'signature': signature,
-            'expires_at': expires_at,
-            'expires_in_minutes': CODE_EXPIRY_MINUTES,
-            'signing_method': signing_method
-        }
+        # Combine: keyId (10 bits) + mac (90 bits) = 100 bits
+        full_bits = key_id_bits + mac_bits
         
-        logger.info(f"Code generated: {code[:8]}...")
-        return create_response(200, response_body)
+        # Encode as words
+        words = encode_bits_to_words(full_bits)
+        words_string = ' '.join(words)
+        
+        logger.info(f"Code generated: keyId={key_id}, words={words_string[:50]}...")
+        
+        return create_response(200, {
+            'words': words_string,
+            'expires_in_hours': CODE_EXPIRY_HOURS
+        })
         
     except ValueError as e:
         logger.error(f"Validation error: {e}")
@@ -166,4 +163,3 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     except Exception as e:
         logger.error(f"Unexpected error: {e}", exc_info=True)
         return create_response(500, {'error': 'Internal server error'})
-

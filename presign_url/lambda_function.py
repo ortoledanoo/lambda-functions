@@ -1,7 +1,8 @@
 """
 Presign URL Lambda Function (Account B).
 
-Generates presigned S3 URLs for authorized file uploads.
+Generates presigned S3 URLs using STS AssumeRole for better security.
+Supports both single-part and multipart uploads.
 This Lambda runs in Account B (same account as authorizer function).
 """
 import os
@@ -22,21 +23,56 @@ if not logger.handlers:
     handler.setFormatter(formatter)
     logger.addHandler(handler)
 
-# Initialize S3 client
-s3_client = boto3.client('s3')
-
 # Configuration
-def get_env_var(key: str, default: Optional[str] = None) -> str:
-    """Get environment variable with optional default."""
-    value = os.environ.get(key, default)
-    if value is None:
-        raise ValueError(f"Environment variable {key} is required but not set")
-    return value
+BUCKET_NAME = os.environ.get('UPLOAD_BUCKET_NAME')
+if not BUCKET_NAME:
+    raise ValueError("UPLOAD_BUCKET_NAME environment variable is required")
 
-S3_BUCKET_NAME = get_env_var('S3_BUCKET_NAME')
-PRESIGNED_URL_EXPIRY_SECONDS = int(os.environ.get('PRESIGNED_URL_EXPIRY_SECONDS', '3600'))
+MINIMAL_S3_ROLE_ARN = os.environ.get('MINIMAL_S3_ROLE_ARN')
+if not MINIMAL_S3_ROLE_ARN:
+    raise ValueError("MINIMAL_S3_ROLE_ARN environment variable is required")
+
 ALLOWED_CONTENT_TYPES = os.environ.get('ALLOWED_CONTENT_TYPES', '*/*').split(',')
-MAX_FILE_SIZE_MB = int(os.environ.get('MAX_FILE_SIZE_MB', '100'))
+MAX_FILE_SIZE_MB = int(os.environ.get('MAX_FILE_SIZE_MB', '5000'))  # Default: 5GB for multipart
+
+# Initialize STS client
+sts_client = boto3.client('sts')
+
+
+def get_s3_client_with_assumed_role():
+    """
+    Get S3 client with credentials from STS AssumeRole.
+    
+    Returns:
+        boto3 S3 client with assumed role credentials
+    """
+    try:
+        logger.info(f"Attempting to assume role: {MINIMAL_S3_ROLE_ARN}")
+        response = sts_client.assume_role(
+            RoleArn=MINIMAL_S3_ROLE_ARN,
+            RoleSessionName=f'PresignedUrlSession-{int(time.time())}',
+            DurationSeconds=900  # 15 minutes
+        )
+        
+        if not response.get('Credentials'):
+            raise ValueError('No credentials returned from AssumeRole')
+        
+        credentials = response['Credentials']
+        logger.info('Successfully assumed role')
+        
+        # Create S3 client with assumed role credentials
+        s3_client = boto3.client(
+            's3',
+            aws_access_key_id=credentials['AccessKeyId'],
+            aws_secret_access_key=credentials['SecretAccessKey'],
+            aws_session_token=credentials['SessionToken']
+        )
+        
+        return s3_client
+        
+    except ClientError as e:
+        logger.error(f"Failed to assume role: {e}")
+        raise
 
 
 def create_response(status_code: int, body: Dict[str, Any]) -> Dict[str, Any]:
@@ -46,45 +82,210 @@ def create_response(status_code: int, body: Dict[str, Any]) -> Dict[str, Any]:
         'headers': {
             'Content-Type': 'application/json',
             'Access-Control-Allow-Origin': '*',
+            'Access-Control-Allow-Headers': 'Content-Type,x-authorization-words,Authorization',
+            'Access-Control-Allow-Methods': 'GET,POST,PUT,OPTIONS'
         },
         'body': json.dumps(body)
     }
 
 
-def generate_presigned_url(code: str, filename: Optional[str] = None, content_type: Optional[str] = None) -> Dict[str, Any]:
-    """Generate a presigned S3 URL for file upload."""
-    timestamp = int(time.time())
+def get_presigned_url(key: str, content_type: str) -> Dict[str, Any]:
+    """
+    Generate presigned URL for single-part upload.
     
-    if filename:
-        safe_filename = os.path.basename(filename).replace('..', '').replace('/', '')
-        s3_key = f"uploads/{code}/{timestamp}-{safe_filename}"
-    else:
-        s3_key = f"uploads/{code}/{timestamp}"
+    Args:
+        key: S3 object key
+        content_type: Content type of the file
+        
+    Returns:
+        Dictionary with presigned URL
+    """
+    s3_client = get_s3_client_with_assumed_role()
     
     try:
-        conditions = []
-        fields = {}
+        from botocore.signers import RequestSigner
+        from botocore.awsrequest import AWSRequest
         
-        if content_type:
-            conditions.append(['eq', '$Content-Type', content_type])
-            fields = {'Content-Type': content_type}
-        
-        max_bytes = MAX_FILE_SIZE_MB * 1024 * 1024
-        conditions.append(['content-length-range', 0, max_bytes])
-        
-        response = s3_client.generate_presigned_post(
-            Bucket=S3_BUCKET_NAME,
-            Key=s3_key,
-            Fields=fields,
-            Conditions=conditions,
-            ExpiresIn=PRESIGNED_URL_EXPIRY_SECONDS
+        # Generate presigned URL
+        url = s3_client.generate_presigned_url(
+            'put_object',
+            Params={
+                'Bucket': BUCKET_NAME,
+                'Key': key,
+                'ContentType': content_type
+            },
+            ExpiresIn=300  # 5 minutes
         )
         
-        logger.info(f"Generated presigned URL for code: {code[:8]}..., key: {s3_key}")
-        return response
+        return {'url': url}
+        
+    except Exception as e:
+        logger.error(f"Failed to generate presigned URL: {e}")
+        raise
+
+
+def create_multipart_upload(key: str, content_type: str) -> Dict[str, Any]:
+    """
+    Create multipart upload.
+    
+    Args:
+        key: S3 object key
+        content_type: Content type of the file
+        
+    Returns:
+        Dictionary with uploadId
+    """
+    s3_client = get_s3_client_with_assumed_role()
+    
+    try:
+        response = s3_client.create_multipart_upload(
+            Bucket=BUCKET_NAME,
+            Key=key,
+            ContentType=content_type
+        )
+        
+        return {
+            'uploadId': response['UploadId'],
+            'key': key
+        }
         
     except ClientError as e:
-        logger.error(f"S3 presigned URL generation failed: {e}")
+        logger.error(f"Failed to create multipart upload: {e}")
+        raise
+
+
+def get_signed_url_for_part(key: str, upload_id: str, part_number: int) -> Dict[str, Any]:
+    """
+    Generate presigned URL for a multipart upload part.
+    
+    Args:
+        key: S3 object key
+        upload_id: Multipart upload ID
+        part_number: Part number (1-indexed)
+        
+    Returns:
+        Dictionary with presigned URL
+    """
+    s3_client = get_s3_client_with_assumed_role()
+    
+    try:
+        url = s3_client.generate_presigned_url(
+            'upload_part',
+            Params={
+                'Bucket': BUCKET_NAME,
+                'Key': key,
+                'UploadId': upload_id,
+                'PartNumber': part_number
+            },
+            ExpiresIn=300  # 5 minutes
+        )
+        
+        return {'url': url}
+        
+    except ClientError as e:
+        logger.error(f"Failed to generate signed URL for part: {e}")
+        raise
+
+
+def list_parts(key: str, upload_id: str) -> Dict[str, Any]:
+    """
+    List parts of a multipart upload.
+    
+    Args:
+        key: S3 object key
+        upload_id: Multipart upload ID
+        
+    Returns:
+        Dictionary with parts list
+    """
+    s3_client = get_s3_client_with_assumed_role()
+    
+    try:
+        response = s3_client.list_parts(
+            Bucket=BUCKET_NAME,
+            Key=key,
+            UploadId=upload_id
+        )
+        
+        parts = []
+        if response.get('Parts'):
+            for part in response['Parts']:
+                parts.append({
+                    'PartNumber': part['PartNumber'],
+                    'ETag': part['ETag'],
+                    'Size': part.get('Size')
+                })
+        
+        return {'parts': parts}
+        
+    except ClientError as e:
+        logger.error(f"Failed to list parts: {e}")
+        raise
+
+
+def complete_multipart_upload(key: str, upload_id: str, parts: list) -> Dict[str, Any]:
+    """
+    Complete multipart upload.
+    
+    Args:
+        key: S3 object key
+        upload_id: Multipart upload ID
+        parts: List of parts with ETag and PartNumber
+        
+    Returns:
+        Dictionary with completion result
+    """
+    s3_client = get_s3_client_with_assumed_role()
+    
+    try:
+        # Convert parts to S3 format
+        multipart_parts = [
+            {'PartNumber': p['PartNumber'], 'ETag': p['ETag']}
+            for p in parts
+        ]
+        
+        response = s3_client.complete_multipart_upload(
+            Bucket=BUCKET_NAME,
+            Key=key,
+            UploadId=upload_id,
+            MultipartUpload={'Parts': multipart_parts}
+        )
+        
+        return {
+            'location': response.get('Location'),
+            'etag': response.get('ETag'),
+            'key': key
+        }
+        
+    except ClientError as e:
+        logger.error(f"Failed to complete multipart upload: {e}")
+        raise
+
+
+def abort_multipart_upload(key: str, upload_id: str) -> Dict[str, Any]:
+    """
+    Abort multipart upload.
+    
+    Args:
+        key: S3 object key
+        upload_id: Multipart upload ID
+        
+    Returns:
+        Dictionary with success status
+    """
+    s3_client = get_s3_client_with_assumed_role()
+    
+    try:
+        s3_client.abort_multipart_upload(
+            Bucket=BUCKET_NAME,
+            Key=key,
+            UploadId=upload_id
+        )
+        
+        return {'success': True}
+        
+    except ClientError as e:
+        logger.error(f"Failed to abort multipart upload: {e}")
         raise
 
 
@@ -112,54 +313,88 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     try:
         logger.info("Presign URL Lambda invoked")
         
-        # Extract code from authorizer context
+        # Extract code/keyId from authorizer context
         authorizer_context = event.get('requestContext', {}).get('authorizer', {})
-        code = authorizer_context.get('principalId')
+        key_id = authorizer_context.get('principalId')
         
-        # If not in authorizer context, try body/query params
-        if not code:
+        # If not in authorizer context, code should be validated separately
+        if not key_id:
+            # Try to get from body (if called standalone after validation)
             body = {}
             if 'body' in event:
                 body = json.loads(event['body']) if isinstance(event['body'], str) else event['body']
-            code = body.get('code') or event.get('queryStringParameters', {}).get('code')
-            
-            if not code:
-                return create_response(400, {'error': 'Missing authorization code'})
+            key_id = body.get('key_id') or body.get('code')
         
         # Parse request body
         body = {}
         if 'body' in event:
             body = json.loads(event['body']) if isinstance(event['body'], str) else event['body']
         
-        filename = body.get('filename')
-        content_type = body.get('content_type') or body.get('contentType')
+        action = body.get('action', 'getPresignedUrl')
+        key = body.get('key')
+        content_type = body.get('contentType') or body.get('content_type')
+        upload_id = body.get('uploadId')
+        part_number = body.get('partNumber')
+        parts = body.get('parts')
         
-        # Validate content type
+        # Validate content type if provided
         if content_type and not validate_content_type(content_type):
             return create_response(400, {'error': f'Content type not allowed: {content_type}'})
         
-        # Generate presigned URL
-        presigned_data = generate_presigned_url(code=code, filename=filename, content_type=content_type)
+        # Generate S3 key if not provided
+        if not key:
+            timestamp = int(time.time())
+            filename = body.get('filename', '')
+            if filename:
+                safe_filename = os.path.basename(filename).replace('..', '').replace('/', '')
+                key = f"uploads/{key_id}/{timestamp}-{safe_filename}"
+            else:
+                key = f"uploads/{key_id}/{timestamp}"
         
-        response_body = {
-            'presigned_url': presigned_data['url'],
-            'fields': presigned_data['fields'],
-            'method': 'POST',
-            'expires_in_seconds': PRESIGNED_URL_EXPIRY_SECONDS,
-            'max_file_size_mb': MAX_FILE_SIZE_MB,
-            'bucket': S3_BUCKET_NAME
-        }
+        # Handle different actions
+        result = None
+        if action == 'getPresignedUrl':
+            if not content_type:
+                return create_response(400, {'error': 'contentType is required for single-part upload'})
+            result = get_presigned_url(key, content_type)
+            
+        elif action == 'createMultipartUpload':
+            if not content_type:
+                return create_response(400, {'error': 'contentType is required for multipart upload'})
+            result = create_multipart_upload(key, content_type)
+            
+        elif action == 'getSignedUrlForPart':
+            if not upload_id or not part_number:
+                return create_response(400, {'error': 'uploadId and partNumber are required'})
+            result = get_signed_url_for_part(key, upload_id, part_number)
+            
+        elif action == 'listParts':
+            if not upload_id:
+                return create_response(400, {'error': 'uploadId is required'})
+            result = list_parts(key, upload_id)
+            
+        elif action == 'completeMultipartUpload':
+            if not upload_id or not parts:
+                return create_response(400, {'error': 'uploadId and parts are required'})
+            result = complete_multipart_upload(key, upload_id, parts)
+            
+        elif action == 'abortMultipartUpload':
+            if not upload_id:
+                return create_response(400, {'error': 'uploadId is required'})
+            result = abort_multipart_upload(key, upload_id)
+            
+        else:
+            return create_response(400, {'error': f'Unknown action: {action}'})
         
-        logger.info(f"Presigned URL generated for code: {code[:8]}...")
-        return create_response(200, response_body)
+        logger.info(f"Action {action} completed successfully for key: {key}")
+        return create_response(200, result)
         
     except ValueError as e:
         logger.error(f"Validation error: {e}")
         return create_response(400, {'error': str(e)})
     except ClientError as e:
         logger.error(f"AWS service error: {e}")
-        return create_response(500, {'error': 'Failed to generate presigned URL'})
+        return create_response(500, {'error': f'AWS error: {str(e)}'})
     except Exception as e:
         logger.error(f"Unexpected error: {e}", exc_info=True)
         return create_response(500, {'error': 'Internal server error'})
-
