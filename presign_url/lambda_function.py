@@ -1,73 +1,74 @@
 """
-Presign URL Lambda Function.
+Presign URL Lambda Function (Account B).
 
 Generates presigned S3 URLs for authorized file uploads.
+This Lambda runs in Account B (same account as authorizer function).
 """
 import os
 import json
+import logging
 import time
 from typing import Dict, Any, Optional
 
 import boto3
 from botocore.exceptions import ClientError
 
-from shared.utils import setup_logger, get_env_var, create_response
-
-# Initialize logger
-logger = setup_logger(__name__)
+# Setup logger
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
+if not logger.handlers:
+    handler = logging.StreamHandler()
+    formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    handler.setFormatter(formatter)
+    logger.addHandler(handler)
 
 # Initialize S3 client
 s3_client = boto3.client('s3')
 
-# Configuration from environment variables
+# Configuration
+def get_env_var(key: str, default: Optional[str] = None) -> str:
+    """Get environment variable with optional default."""
+    value = os.environ.get(key, default)
+    if value is None:
+        raise ValueError(f"Environment variable {key} is required but not set")
+    return value
+
 S3_BUCKET_NAME = get_env_var('S3_BUCKET_NAME')
-PRESIGNED_URL_EXPIRY_SECONDS = int(os.environ.get('PRESIGNED_URL_EXPIRY_SECONDS', '3600'))  # Default: 1 hour
+PRESIGNED_URL_EXPIRY_SECONDS = int(os.environ.get('PRESIGNED_URL_EXPIRY_SECONDS', '3600'))
 ALLOWED_CONTENT_TYPES = os.environ.get('ALLOWED_CONTENT_TYPES', '*/*').split(',')
-MAX_FILE_SIZE_MB = int(os.environ.get('MAX_FILE_SIZE_MB', '100'))  # Default: 100MB
+MAX_FILE_SIZE_MB = int(os.environ.get('MAX_FILE_SIZE_MB', '100'))
 
 
-def generate_presigned_url(
-    code: str,
-    filename: Optional[str] = None,
-    content_type: Optional[str] = None
-) -> str:
-    """
-    Generate a presigned S3 URL for file upload.
-    
-    Args:
-        code: Authorized code (used as prefix in S3 key)
-        filename: Optional filename
-        content_type: Optional content type for the upload
-        
-    Returns:
-        Presigned URL string
-        
-    Raises:
-        ClientError: If S3 operation fails
-    """
-    # Construct S3 key with code prefix for organization
+def create_response(status_code: int, body: Dict[str, Any]) -> Dict[str, Any]:
+    """Create API Gateway response."""
+    return {
+        'statusCode': status_code,
+        'headers': {
+            'Content-Type': 'application/json',
+            'Access-Control-Allow-Origin': '*',
+        },
+        'body': json.dumps(body)
+    }
+
+
+def generate_presigned_url(code: str, filename: Optional[str] = None, content_type: Optional[str] = None) -> Dict[str, Any]:
+    """Generate a presigned S3 URL for file upload."""
     timestamp = int(time.time())
     
     if filename:
-        # Sanitize filename to prevent path traversal
         safe_filename = os.path.basename(filename).replace('..', '').replace('/', '')
         s3_key = f"uploads/{code}/{timestamp}-{safe_filename}"
     else:
         s3_key = f"uploads/{code}/{timestamp}"
     
-    # Generate presigned POST URL (allows more control than PUT)
     try:
         conditions = []
+        fields = {}
         
-        # Add content type condition if specified
         if content_type:
             conditions.append(['eq', '$Content-Type', content_type])
-            # Also add to fields for POST
             fields = {'Content-Type': content_type}
-        else:
-            fields = {}
         
-        # Add file size limit condition
         max_bytes = MAX_FILE_SIZE_MB * 1024 * 1024
         conditions.append(['content-length-range', 0, max_bytes])
         
@@ -88,26 +89,15 @@ def generate_presigned_url(
 
 
 def validate_content_type(content_type: Optional[str]) -> bool:
-    """
-    Validate that content type is allowed.
-    
-    Args:
-        content_type: Content type to validate
-        
-    Returns:
-        True if allowed or wildcard is set, False otherwise
-    """
+    """Validate that content type is allowed."""
     if '*' in ALLOWED_CONTENT_TYPES:
         return True
-    
     if not content_type:
         return False
     
-    # Check if content type matches any allowed pattern
     for allowed in ALLOWED_CONTENT_TYPES:
         allowed = allowed.strip()
         if allowed.endswith('/*'):
-            # Wildcard match for type
             base_type = allowed.split('/')[0]
             if content_type.startswith(f"{base_type}/"):
                 return True
@@ -118,75 +108,39 @@ def validate_content_type(content_type: Optional[str]) -> bool:
 
 
 def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
-    """
-    Lambda handler for presigned URL generation.
-    
-    Expected event structure (after authorization):
-    {
-        "requestContext": {
-            "authorizer": {
-                "principalId": "code"  # From authorizer Lambda
-            }
-        },
-        "body": {
-            "filename": "example.pdf",  # Optional
-            "content_type": "application/pdf"  # Optional
-        }
-    }
-    
-    Returns:
-        API Gateway response with presigned URL
-    """
+    """Lambda handler for presigned URL generation."""
     try:
         logger.info("Presign URL Lambda invoked")
         
-        # Extract code from authorizer context (set by API Gateway after authorization)
+        # Extract code from authorizer context
         authorizer_context = event.get('requestContext', {}).get('authorizer', {})
         code = authorizer_context.get('principalId')
         
-        # If not in authorizer context, try to extract from body/query params
+        # If not in authorizer context, try body/query params
         if not code:
             body = {}
             if 'body' in event:
-                if isinstance(event['body'], str):
-                    body = json.loads(event['body'])
-                else:
-                    body = event['body']
-            
+                body = json.loads(event['body']) if isinstance(event['body'], str) else event['body']
             code = body.get('code') or event.get('queryStringParameters', {}).get('code')
             
             if not code:
-                return create_response(
-                    400,
-                    {'error': 'Missing authorization code'}
-                )
+                return create_response(400, {'error': 'Missing authorization code'})
         
-        # Parse request body for optional parameters
+        # Parse request body
         body = {}
         if 'body' in event:
-            if isinstance(event['body'], str):
-                body = json.loads(event['body'])
-            else:
-                body = event['body']
+            body = json.loads(event['body']) if isinstance(event['body'], str) else event['body']
         
         filename = body.get('filename')
         content_type = body.get('content_type') or body.get('contentType')
         
-        # Validate content type if provided
+        # Validate content type
         if content_type and not validate_content_type(content_type):
-            return create_response(
-                400,
-                {'error': f'Content type not allowed: {content_type}'}
-            )
+            return create_response(400, {'error': f'Content type not allowed: {content_type}'})
         
         # Generate presigned URL
-        presigned_data = generate_presigned_url(
-            code=code,
-            filename=filename,
-            content_type=content_type
-        )
+        presigned_data = generate_presigned_url(code=code, filename=filename, content_type=content_type)
         
-        # Prepare response
         response_body = {
             'presigned_url': presigned_data['url'],
             'fields': presigned_data['fields'],
@@ -196,7 +150,7 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
             'bucket': S3_BUCKET_NAME
         }
         
-        logger.info(f"Presigned URL generated successfully for code: {code[:8]}...")
+        logger.info(f"Presigned URL generated for code: {code[:8]}...")
         return create_response(200, response_body)
         
     except ValueError as e:
@@ -208,5 +162,4 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     except Exception as e:
         logger.error(f"Unexpected error: {e}", exc_info=True)
         return create_response(500, {'error': 'Internal server error'})
-
 
