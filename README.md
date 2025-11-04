@@ -6,18 +6,19 @@ A production-grade backend system for secure file upload workflows using AWS Lam
 
 This system implements a secure three-step flow for file uploads across **two AWS accounts**:
 
-- **Account A**: Code Generator Lambda (generates word-based signed codes)
-- **Account B**: Authorizer Lambda + Presign URL Lambda (validates codes cryptographically and generates S3 URLs)
+- **Account A**: Code Generator Lambda + Authorizer Lambda (share KMS key for code signing and validation)
+- **Account B**: Presign URL Lambda (generates S3 URLs in separate account)
 
 ### Two-Account Architecture
 
 ```
-Account A (Code Generation):
+Account A (Code Generation & Authorization):
 ├── Code Generator Lambda
-└── DynamoDB Table (only for daily counter)
-
-Account B (Authorization & Upload):
 ├── Authorizer Lambda (pure cryptographic validation - no DynamoDB)
+├── DynamoDB Table (only for daily counter)
+└── KMS Key (shared between code generator and authorizer)
+
+Account B (Upload):
 ├── Presign URL Lambda (STS AssumeRole + multipart support)
 └── S3 Bucket (for file uploads)
 ```
@@ -31,7 +32,7 @@ Account B (Authorization & Upload):
    → Encode as 10 words
    → Returns: "word0001 word0023 ... word0999"
                                         ↓
-2. Client → Authorizer Lambda (Account B)
+2. Client → Authorizer Lambda (Account A)
    → Decode words to bits
    → Regenerate MAC with KMS (try hours within TTL window)
    → Validate signature + check TTL
@@ -85,7 +86,7 @@ When a user requests a code, the system:
    - Dictionary: `word0000`, `word0001`, ... `word1023`
    - Example output: `word0001 word0023 word0456 word0789 word0123 word0456 word0789 word0123 word0456 word0789`
 
-#### 2. Code Validation (Account B)
+#### 2. Code Validation (Account A)
 
 When a user provides a code, the system:
 
@@ -158,7 +159,7 @@ Without the real printer (KMS key), you can't create a valid ticket (code).
 - `DYNAMODB_TABLE_NAME` (optional): Table for counter (default: `file-whitelist-codes`)
 - `CODE_EXPIRY_HOURS` (optional): TTL in hours (default: 24)
 
-### 2. Authorizer Lambda (`authorizer/`) - Account B
+### 2. Authorizer Lambda (`authorizer/`) - Account A
 
 **Purpose**: Validates codes using pure cryptographic validation (no DynamoDB).
 
@@ -204,8 +205,8 @@ X-Authorization-Words: word0001 word0023 ... word0999
 - IAM policy document for API Gateway
 
 **Environment Variables**:
-- `KMS_KEY_ID` (required): KMS key ID or ARN (must match Account A)
-- `CODE_EXPIRY_HOURS` (optional): TTL in hours (default: 24, must match Account A)
+- `KMS_KEY_ID` (required): KMS key ID or ARN (same KMS key as code generator)
+- `CODE_EXPIRY_HOURS` (optional): TTL in hours (default: 24, must match code generator)
 - `API_GW_ARN` (optional): API Gateway ARN for policy (default: `*`)
 
 ### 3. Presign URL Lambda (`presign_url/`) - Account B
@@ -277,23 +278,21 @@ X-Authorization-Words: word0001 word0023 ... word0999
 ### Account A Resources
 
 - **Code Generator Lambda Function**
+- **Authorizer Lambda Function**
 - **DynamoDB Table**: For daily counter only
   - Table name: `file-whitelist-codes` (configurable)
   - Partition key: `counterId` (String)
   - Billing mode: Pay-per-request
-- **KMS Key**: For code signing
+- **KMS Key**: For code signing (shared between code generator and authorizer)
   - Key usage: `GenerateMac`
   - Algorithm: `HMAC_SHA_256`
-  - Must be accessible from Account B (or shared)
+- **API Gateway** (optional): For HTTP endpoints (if using API Gateway authorizer)
 
 ### Account B Resources
 
-- **Authorizer Lambda Function**
 - **Presign URL Lambda Function**
 - **S3 Bucket**: For file uploads
 - **IAM Role**: For STS AssumeRole (minimal S3 permissions)
-- **KMS Key Access**: Read access to same KMS key as Account A
-- **API Gateway** (optional): For HTTP endpoints
 
 ## Environment Variables Summary
 
@@ -305,12 +304,12 @@ X-Authorization-Words: word0001 word0023 ... word0999
 | `DYNAMODB_TABLE_NAME` | No | `file-whitelist-codes` | DynamoDB table for counter |
 | `CODE_EXPIRY_HOURS` | No | `24` | Code expiration in hours |
 
-### Authorizer Lambda (Account B)
+### Authorizer Lambda (Account A)
 
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
-| `KMS_KEY_ID` | Yes | - | KMS key ID or ARN (must match Account A) |
-| `CODE_EXPIRY_HOURS` | No | `24` | TTL in hours (must match Account A) |
+| `KMS_KEY_ID` | Yes | - | KMS key ID or ARN (same KMS key as code generator) |
+| `CODE_EXPIRY_HOURS` | No | `24` | TTL in hours (must match code generator) |
 | `API_GW_ARN` | No | `*` | API Gateway ARN for policy |
 
 ### Presign URL Lambda (Account B)
@@ -337,9 +336,9 @@ aws dynamodb create-table \
   --profile account-a
 ```
 
-### Step 2: Create KMS Key (Shared or Cross-Account)
+### Step 2: Create KMS Key (Account A)
 
-Create KMS key with HMAC_SHA_256 support:
+Create KMS key with HMAC_SHA_256 support. This key will be shared between Code Generator and Authorizer Lambdas in Account A:
 
 ```bash
 # In Account A
@@ -349,12 +348,7 @@ aws kms create-key \
   --key-usage GENERATE_VERIFY_MAC \
   --profile account-a
 
-# Grant Account B access (or use shared key)
-aws kms create-grant \
-  --key-id <KEY_ID> \
-  --grantee-principal arn:aws:iam::ACCOUNT_B_ID:root \
-  --operations GenerateMac VerifyMac \
-  --profile account-a
+# Note: Both Code Generator and Authorizer Lambdas in Account A will use this same KMS key
 ```
 
 ### Step 3: Deploy Code Generator Lambda (Account A)
@@ -383,7 +377,7 @@ aws lambda create-function \
   --profile account-a
 ```
 
-### Step 4: Deploy Authorizer Lambda (Account B)
+### Step 4: Deploy Authorizer Lambda (Account A)
 
 **Important**: Deploy the Authorizer Lambda **before** configuring API Gateway, as API Gateway needs the Lambda ARN.
 
@@ -400,15 +394,15 @@ zip -r ../authorizer.zip . -x "*.pyc" "__pycache__/*"
 aws lambda create-function \
   --function-name file-whitelist-authorizer \
   --runtime python3.11 \
-  --role arn:aws:iam::ACCOUNT_B_ID:role/lambda-execution-role \
+  --role arn:aws:iam::ACCOUNT_A_ID:role/lambda-execution-role \
   --handler lambda_function.lambda_handler \
   --zip-file fileb://../authorizer.zip \
   --environment Variables="{
     KMS_KEY_ID=arn:aws:kms:region:ACCOUNT_A_ID:key/KEY_ID,
     CODE_EXPIRY_HOURS=24,
-    API_GW_ARN=arn:aws:execute-api:region:ACCOUNT_B_ID:api-id/*/*
+    API_GW_ARN=arn:aws:execute-api:region:ACCOUNT_A_ID:api-id/*/*
   }" \
-  --profile account-b
+  --profile account-a
 
 # Grant API Gateway permission to invoke the authorizer
 aws lambda add-permission \
@@ -416,7 +410,7 @@ aws lambda add-permission \
   --statement-id api-gateway-invoke \
   --action lambda:InvokeFunction \
   --principal apigateway.amazonaws.com \
-  --profile account-b
+  --profile account-a
 ```
 
 **Note**: Get the Lambda ARN for the next step:
@@ -425,10 +419,12 @@ AUTHORIZER_ARN=$(aws lambda get-function \
   --function-name file-whitelist-authorizer \
   --query 'Configuration.FunctionArn' \
   --output text \
-  --profile account-b)
+  --profile account-a)
 ```
 
-### Step 5: Deploy API Gateway with Lambda Authorizer (Account B)
+### Step 5: Deploy API Gateway with Lambda Authorizer (Account A)
+
+**Note**: If your API Gateway is in Account B (for presign URL), you'll need to configure cross-account Lambda authorizer access. For simplicity, API Gateway can also be deployed in Account A.
 
 You can use either **REST API** or **HTTP API**. HTTP API is simpler and cheaper, but REST API offers more control.
 
@@ -442,7 +438,7 @@ API_ID=$(aws apigateway create-rest-api \
   --name file-whitelist-api \
   --description "File whitelist API with Lambda authorizer" \
   --endpoint-configuration types=REGIONAL \
-  --profile account-b \
+  --profile account-a \
   --query 'id' \
   --output text)
 
@@ -454,7 +450,7 @@ echo "API ID: $API_ID"
 ```bash
 ROOT_RESOURCE_ID=$(aws apigateway get-resources \
   --rest-api-id $API_ID \
-  --profile account-b \
+  --profile account-a \
   --query 'items[?path==`/`].id' \
   --output text)
 
@@ -468,7 +464,7 @@ RESOURCE_ID=$(aws apigateway create-resource \
   --rest-api-id $API_ID \
   --parent-id $ROOT_RESOURCE_ID \
   --path-part presign-url \
-  --profile account-b \
+  --profile account-a \
   --query 'id' \
   --output text)
 
@@ -483,7 +479,7 @@ AUTHORIZER_ARN=$(aws lambda get-function \
   --function-name file-whitelist-authorizer \
   --query 'Configuration.FunctionArn' \
   --output text \
-  --profile account-b)
+  --profile account-a)
 
 # Create authorizer
 AUTHORIZER_ID=$(aws apigateway create-authorizer \
@@ -492,8 +488,8 @@ AUTHORIZER_ID=$(aws apigateway create-authorizer \
   --type TOKEN \
   --authorizer-uri "arn:aws:apigateway:REGION:lambda:path/2015-03-31/functions/$AUTHORIZER_ARN/invocations" \
   --identity-source method.request.header.Authorization \
-  --authorizer-credentials $(aws iam get-role --role-name api-gateway-invoke-role --query 'Role.Arn' --output text --profile account-b) \
-  --profile account-b \
+  --authorizer-credentials $(aws iam get-role --role-name api-gateway-invoke-role --query 'Role.Arn' --output text --profile account-a) \
+  --profile account-a \
   --query 'id' \
   --output text)
 
@@ -510,16 +506,16 @@ aws apigateway put-method \
   --http-method POST \
   --authorization-type CUSTOM \
   --authorizer-id $AUTHORIZER_ID \
-  --profile account-b
+  --profile account-a
 
-# Get Presign URL Lambda ARN
+# Get Presign URL Lambda ARN (in Account B)
 PRESIGN_ARN=$(aws lambda get-function \
   --function-name file-whitelist-presign-url \
   --query 'Configuration.FunctionArn' \
   --output text \
   --profile account-b)
 
-# Set up Lambda integration
+# Set up Lambda integration (cross-account)
 aws apigateway put-integration \
   --rest-api-id $API_ID \
   --resource-id $RESOURCE_ID \
@@ -527,15 +523,15 @@ aws apigateway put-integration \
   --type AWS_PROXY \
   --integration-http-method POST \
   --uri "arn:aws:apigateway:REGION:lambda:path/2015-03-31/functions/$PRESIGN_ARN/invocations" \
-  --profile account-b
+  --profile account-a
 
-# Grant API Gateway permission to invoke Presign URL Lambda
+# Grant API Gateway permission to invoke Presign URL Lambda (cross-account)
 aws lambda add-permission \
   --function-name file-whitelist-presign-url \
   --statement-id api-gateway-invoke \
   --action lambda:InvokeFunction \
   --principal apigateway.amazonaws.com \
-  --source-arn "arn:aws:execute-api:REGION:ACCOUNT_B_ID:$API_ID/*/*" \
+  --source-arn "arn:aws:execute-api:REGION:ACCOUNT_A_ID:$API_ID/*/*" \
   --profile account-b
 ```
 
@@ -546,7 +542,7 @@ aws lambda add-permission \
 aws apigateway create-deployment \
   --rest-api-id $API_ID \
   --stage-name prod \
-  --profile account-b
+  --profile account-a
 
 # Get API Gateway URL
 API_URL="https://$API_ID.execute-api.REGION.amazonaws.com/prod"
@@ -576,13 +572,13 @@ EOF
 aws iam create-role \
   --role-name api-gateway-invoke-role \
   --assume-role-policy-document file:///tmp/trust-policy.json \
-  --profile account-b
+  --profile account-a
 
 # Attach policy to allow Lambda invocation
 aws iam attach-role-policy \
   --role-name api-gateway-invoke-role \
   --policy-arn arn:aws:iam::aws:policy/service-role/AWSLambdaRole \
-  --profile account-b
+  --profile account-a
 ```
 
 #### Option B: HTTP API (Simpler, Cheaper)
@@ -595,7 +591,7 @@ API_ID=$(aws apigatewayv2 create-api \
   --name file-whitelist-api \
   --protocol-type HTTP \
   --cors-configuration AllowOrigins="*",AllowMethods="POST,OPTIONS",AllowHeaders="*" \
-  --profile account-b \
+  --profile account-a \
   --query 'ApiId' \
   --output text)
 
@@ -610,7 +606,7 @@ AUTHORIZER_ARN=$(aws lambda get-function \
   --function-name file-whitelist-authorizer \
   --query 'Configuration.FunctionArn' \
   --output text \
-  --profile account-b)
+  --profile account-a)
 
 # Create authorizer
 AUTHORIZER_ID=$(aws apigatewayv2 create-authorizer \
@@ -620,7 +616,7 @@ AUTHORIZER_ID=$(aws apigatewayv2 create-authorizer \
   --identity-source '$request.header.Authorization' \
   --authorizer-payload-format-version '2.0' \
   --name file-whitelist-authorizer \
-  --profile account-b \
+  --profile account-a \
   --query 'AuthorizerId' \
   --output text)
 
@@ -630,20 +626,20 @@ echo "Authorizer ID: $AUTHORIZER_ID"
 **3. Create Route with Authorizer:**
 
 ```bash
-# Get Presign URL Lambda ARN
+# Get Presign URL Lambda ARN (in Account B)
 PRESIGN_ARN=$(aws lambda get-function \
   --function-name file-whitelist-presign-url \
   --query 'Configuration.FunctionArn' \
   --output text \
   --profile account-b)
 
-# Create integration
+# Create integration (cross-account)
 INTEGRATION_ID=$(aws apigatewayv2 create-integration \
   --api-id $API_ID \
   --integration-type AWS_PROXY \
   --integration-uri "arn:aws:apigateway:REGION:lambda:path/2015-03-31/functions/$PRESIGN_ARN/invocations" \
   --payload-format-version '2.0' \
-  --profile account-b \
+  --profile account-a \
   --query 'IntegrationId' \
   --output text)
 
@@ -654,15 +650,15 @@ aws apigatewayv2 create-route \
   --target "integrations/$INTEGRATION_ID" \
   --authorization-type CUSTOM \
   --authorizer-id $AUTHORIZER_ID \
-  --profile account-b
+  --profile account-a
 
-# Grant API Gateway permission to invoke Presign URL Lambda
+# Grant API Gateway permission to invoke Presign URL Lambda (cross-account)
 aws lambda add-permission \
   --function-name file-whitelist-presign-url \
   --statement-id api-gateway-invoke \
   --action lambda:InvokeFunction \
   --principal apigateway.amazonaws.com \
-  --source-arn "arn:aws:execute-api:REGION:ACCOUNT_B_ID:$API_ID/*/*" \
+  --source-arn "arn:aws:execute-api:REGION:ACCOUNT_A_ID:$API_ID/*/*" \
   --profile account-b
 ```
 
@@ -674,7 +670,7 @@ aws apigatewayv2 create-stage \
   --api-id $API_ID \
   --stage-name $default \
   --auto-deploy \
-  --profile account-b
+  --profile account-a
 
 # Get API Gateway URL
 API_URL="https://$API_ID.execute-api.REGION.amazonaws.com"
@@ -693,7 +689,7 @@ API_GW_ROLE_ARN=$(aws iam get-role \
   --role-name api-gateway-invoke-role \
   --query 'Role.Arn' \
   --output text \
-  --profile account-b 2>/dev/null || echo "")
+  --profile account-a 2>/dev/null || echo "")
 
 # If role doesn't exist, create it (see Step 5 REST API section)
 # Then grant permission
@@ -702,8 +698,8 @@ aws lambda add-permission \
   --statement-id api-gateway-invoke-authorizer \
   --action lambda:InvokeFunction \
   --principal apigateway.amazonaws.com \
-  --source-arn "arn:aws:execute-api:REGION:ACCOUNT_B_ID:$API_ID/authorizers/$AUTHORIZER_ID" \
-  --profile account-b
+  --source-arn "arn:aws:execute-api:REGION:ACCOUNT_A_ID:$API_ID/authorizers/$AUTHORIZER_ID" \
+  --profile account-a
 ```
 
 ### Step 7: Test API Gateway Endpoint
@@ -842,7 +838,7 @@ aws lambda create-function \
 }
 ```
 
-### Account B - Authorizer Lambda Role
+### Account A - Authorizer Lambda Role
 
 ```json
 {
@@ -911,14 +907,14 @@ cat response.json
 # Output: {"words": "word0001 word0023 ... word0999", "expires_in_hours": 24}
 ```
 
-### Test Authorizer (Account B)
+### Test Authorizer (Account A)
 
 ```bash
 # Standalone validation
 aws lambda invoke \
   --function-name file-whitelist-authorizer \
   --payload '{"body": "{\"words\": \"word0001 word0023 word0456 word0789 word0123 word0456 word0789 word0123 word0456 word0789\"}"}' \
-  --profile account-b \
+  --profile account-a \
   response.json
 
 cat response.json
@@ -997,11 +993,12 @@ aws lambda invoke \
 
 ## Important Notes
 
-- **Shared KMS Key**: Must be accessible from both Account A and Account B
+- **Shared KMS Key**: Code Generator and Authorizer Lambdas in Account A share the same KMS key (no cross-account access needed)
 - **No Cross-Account DynamoDB**: Authorizer doesn't need DynamoDB access (pure cryptographic)
 - **Counter Table**: Only needed in Account A for daily counter
 - **Word Format**: Codes are 10 space-separated words (e.g., `word0001 word0023 ...`)
-- **TTL Matching**: `CODE_EXPIRY_HOURS` must match in Account A and Account B
+- **TTL Matching**: `CODE_EXPIRY_HOURS` must match between Code Generator and Authorizer (both in Account A)
+- **Cross-Account API Gateway**: If API Gateway is in Account A and Presign URL Lambda is in Account B, ensure proper cross-account permissions are configured
 
 ## Directory Structure
 
@@ -1029,8 +1026,8 @@ lambda-functions/
 
 ### Authorization Fails
 - Verify words format is correct (10 space-separated words)
-- Check KMS key is accessible from Account B
-- Ensure CODE_EXPIRY_HOURS matches in both accounts
+- Check KMS key is accessible from Authorizer Lambda in Account A
+- Ensure CODE_EXPIRY_HOURS matches between Code Generator and Authorizer (both in Account A)
 - Check code hasn't expired (within TTL window)
 
 ### Presigned URL Fails

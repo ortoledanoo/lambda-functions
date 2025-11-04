@@ -1,9 +1,9 @@
 """
-Authorizer Lambda Function (Account B).
+Authorizer Lambda Function (Account A).
 
 Validates codes using pure cryptographic validation (no DynamoDB).
 Decodes words, validates MAC, and checks TTL.
-This Lambda runs in Account B (same account as presign URL function).
+This Lambda runs in Account A (same account as code generator function to share KMS key).
 """
 import os
 import json

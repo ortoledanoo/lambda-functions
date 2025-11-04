@@ -8,7 +8,7 @@
 
 ## AWS Resources to Create
 
-### 1. KMS Key (Account A or Shared)
+### 1. KMS Key (Account A)
 ```bash
 aws kms create-key \
   --key-spec HMAC_256 \

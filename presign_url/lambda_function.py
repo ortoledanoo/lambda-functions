@@ -3,7 +3,7 @@ Presign URL Lambda Function (Account B).
 
 Generates presigned S3 URLs using STS AssumeRole for better security.
 Supports both single-part and multipart uploads.
-This Lambda runs in Account B (same account as authorizer function).
+This Lambda runs in Account B (different account from authorizer/code generator).
 """
 import os
 import json

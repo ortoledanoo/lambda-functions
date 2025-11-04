@@ -3,7 +3,7 @@ Code Generator Lambda Function (Account A).
 
 Generates KMS-signed codes with expiry using word-based encoding.
 Uses daily counter + date + timestamp for uniqueness and TTL validation.
-This Lambda runs in Account A (separate from authorizer/presign functions).
+This Lambda runs in Account A (same account as authorizer function to share KMS key).
 """
 import os
 import json
